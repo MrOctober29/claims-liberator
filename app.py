@@ -3,30 +3,21 @@ import pdfplumber
 import pandas as pd
 import re
 
-# --- CONFIGURATION & STYLING ---
+# --- CONFIGURATION ---
 st.set_page_config(page_title="Claims Liberator", layout="wide")
-st.markdown("""
-    <style>
-    .metric-card {
-        background-color: #f0f2f6;
-        border-left: 5px solid #ff4b4b;
-        padding: 10px;
-        border-radius: 5px;
-    }
-    </style>
-    """, unsafe_allow_html=True)
 
 # --- HELPER FUNCTIONS ---
-def clean_money(value):
-    """Converts '$1,234.56' to float 1234.56"""
-    if not value: return 0.0
-    # Convert to string, remove $, commas, and newlines
-    clean = str(value).replace('$', '').replace(',', '').replace(' ', '').replace('\n', '')
-    
-    # Handle negative numbers in parentheses e.g., (500) -> -500
+def clean_money_value(val_str):
+    """
+    Takes a single string like '$1,234.56' or '(500)' and makes it a float.
+    Returns 0.0 if empty or invalid.
+    """
+    if not val_str: return 0.0
+    # Remove common currency junk
+    clean = str(val_str).replace('$', '').replace(',', '').replace(' ', '')
+    # Handle accounting negatives: (500) -> -500
     if '(' in clean or ')' in clean:
         clean = '-' + clean.replace('(', '').replace(')', '')
-    
     try:
         return float(clean)
     except ValueError:
@@ -37,11 +28,11 @@ def clean_money(value):
 def parse_pdf(uploaded_file):
     extracted_data = []
     
-    # The cohorts we want to find
+    # Target Cohorts
     cohort_keywords = [
         "HMO Actives", "HMO Retirees", "Horizon/Aetna PPO Actives", 
         "Horizon/Aetna PPO Retirees", "Employee Freestanding Actives", 
-        "Employer Group Waiver Plan", "Employee Freestanding Retirees"
+        "Employee Freestanding Retirees", "Employer Group Waiver Plan"
     ]
     
     with pdfplumber.open(uploaded_file) as pdf:
@@ -55,118 +46,121 @@ def parse_pdf(uploaded_file):
             if month_match:
                 current_month = month_match.group(0)
             
-            # 2. Extract Tables with "Text Strategy"
-            # This setting tells pdfplumber to look for whitespace to find columns
-            # instead of relying on solid lines.
-            tables = page.extract_tables(table_settings={
-                "vertical_strategy": "text", 
-                "horizontal_strategy": "text",
-                "snap_tolerance": 3,
-            })
+            # 2. Extract Tables
+            # We go back to "lines" strategy (default) because it handles the grid better,
+            # but we will manually fix the stacked text inside the loop.
+            tables = page.extract_tables()
             
             for table in tables:
                 for row in table:
-                    # Clean None values
+                    # Basic cleanup: None -> ""
                     raw_row = [str(cell) if cell is not None else "" for cell in row]
+                    if not raw_row: continue
                     
-                    # Skip empty rows
-                    if not raw_row or len(raw_row) < 2: continue
+                    # --- THE HYBRID FIX: EXPLODE BY NEWLINE ---
+                    # Check the first column (Cohort Name). Does it have a newline?
+                    # Example: "Horizon PPO\nFreestanding Actives"
+                    first_cell = raw_row[0]
+                    num_lines = first_cell.count('\n') + 1
                     
-                    # Check first cell for Cohort Name
-                    row_label = raw_row[0].replace('\n', ' ') # Flatten stacked text in label
-                    
-                    # Match Cohort
-                    matched_cohort = next((c for c in cohort_keywords if c in row_label), None)
-                    
-                    if matched_cohort and current_month:
+                    # We will create 'num_lines' separate entries from this one row
+                    for i in range(num_lines):
                         try:
-                            # --- DYNAMIC COLUMN MAPPING ---
-                            # Because whitespace strategies can shift columns, we look for data 
-                            # from the END of the row backwards, which is usually safer.
+                            # 1. Get the Cohort Name for this specific line
+                            # We split the cell and take the i-th part
+                            cohort_cell_parts = first_cell.split('\n')
+                            if i >= len(cohort_cell_parts): continue
                             
-                            # Standard Aon Report usually has ~16-17 columns.
-                            # The last column is Total Plan Cost.
-                            # The 2nd to last is Total Member Cost.
-                            # The 3rd to last is Total Gross Cost.
+                            row_label = cohort_cell_parts[i].strip()
                             
-                            plan_cost = clean_money(raw_row[-1])
-                            member_cost = clean_money(raw_row[-2])
-                            gross_cost = clean_money(raw_row[-3])
+                            # check if valid cohort
+                            matched_cohort = next((c for c in cohort_keywords if c in row_label), None)
                             
-                            # Scripts is trickier. It's usually the first number after the label.
-                            # Let's try to find the first valid number in the row after index 0
-                            scripts = 0
-                            for cell in raw_row[1:5]: # Check columns 1-4
-                                val = clean_money(cell)
-                                if val > 0:
-                                    scripts = val
-                                    break
-                            
-                            entry = {
-                                "Month": current_month,
-                                "Cohort": matched_cohort,
-                                "Scripts": scripts,
-                                "Gross Cost": gross_cost,
-                                "Member Cost": member_cost,
-                                "Plan Cost": plan_cost
-                            }
-                            extracted_data.append(entry)
-                        except (ValueError, IndexError):
+                            if matched_cohort and current_month:
+                                # 2. Extract the numbers for THIS specific line
+                                # We iterate through the columns we care about (Cost, Scripts)
+                                # and split them by newline too, taking the matching i-th part.
+                                
+                                # Helper to grab i-th value from a column
+                                def get_part(col_index, part_index):
+                                    if col_index >= len(raw_row): return "0"
+                                    val_parts = raw_row[col_index].split('\n')
+                                    # If the column has fewer lines than the cohort column, 
+                                    # it usually means it's a single value meant for the whole row 
+                                    # OR empty spacing. For safety, we take index if exists, else 0.
+                                    if part_index < len(val_parts):
+                                        return val_parts[part_index]
+                                    return "0"
+
+                                # Target Columns (Aon Standard): 
+                                # Last = Plan Cost
+                                # 2nd to Last = Member Cost
+                                # 3rd to Last = Gross Cost
+                                # Scripts is tricky, usually column 1
+                                
+                                plan_cost_str = get_part(-1, i)
+                                member_cost_str = get_part(-2, i)
+                                gross_cost_str = get_part(-3, i)
+                                scripts_str = get_part(1, i) 
+
+                                entry = {
+                                    "Month": current_month,
+                                    "Cohort": matched_cohort,
+                                    "Scripts": clean_money_value(scripts_str),
+                                    "Gross Cost": clean_money_value(gross_cost_str),
+                                    "Member Cost": clean_money_value(member_cost_str),
+                                    "Plan Cost": clean_money_value(plan_cost_str)
+                                }
+                                extracted_data.append(entry)
+                        
+                        except Exception:
+                            # If a specific split fails, skip just that sub-row
                             continue
 
     df = pd.DataFrame(extracted_data)
     
-    # Final cleanup to ensure numbers are numbers
+    # Aggregation: Since we might scrape "Retail" and "Mail" separately,
+    # we must SUM them up to get the true monthly total.
     if not df.empty:
-        df['Plan Cost'] = pd.to_numeric(df['Plan Cost']).fillna(0)
-        df['Scripts'] = pd.to_numeric(df['Scripts']).fillna(0)
+        df = df.groupby(["Month", "Cohort"], as_index=False).sum()
 
     return df
 
-# --- UI: MAIN AREA ---
-st.title("💊 Claims Analysis Dashboard")
-st.caption("Using Whitespace-Detection Strategy")
+# --- UI ---
+st.title("Claims Liberator v1.3")
+st.caption("Logic: Split Stacked Rows + Aggregate Retail/Mail")
 
-uploaded_file = st.file_uploader("Drag & Drop your PDF Report here", type="pdf")
+uploaded_file = st.file_uploader("Drag & Drop PDF", type="pdf")
 
 if uploaded_file:
-    with st.spinner('Parsing PDF...'):
+    with st.spinner('Extracting & Aggregating...'):
         df = parse_pdf(uploaded_file)
     
     if not df.empty:
-        st.success("Extraction Complete!")
+        st.success("Success!")
         
-        # --- METRICS ---
+        # Totals
         total_spend = df["Plan Cost"].sum()
         total_scripts = df["Scripts"].sum()
         
-        # Top Cost Driver
-        cohort_spend = df.groupby("Cohort")["Plan Cost"].sum()
-        top_cohort = cohort_spend.idxmax() if not cohort_spend.empty else "N/A"
+        c1, c2 = st.columns(2)
+        c1.metric("Total Plan Spend (Check vs PDF)", f"${total_spend:,.2f}")
+        c2.metric("Total Scripts", f"{int(total_scripts):,}")
         
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Total Plan Spend", f"${total_spend:,.2f}")
-        m2.metric("Total Scripts", f"{int(total_scripts):,}")
-        m3.metric("Top Cost Driver", top_cohort)
-        
-        # --- CHARTS ---
-        tab1, tab2, tab3 = st.tabs(["Spend Trend", "Cohort Breakdown", "Raw Data"])
+        # Tabs
+        tab1, tab2 = st.tabs(["Analysis", "Raw Data Check"])
         
         with tab1:
-            st.subheader("Monthly Plan Cost")
-            # Sort chronologically
+            # Sort Months
             month_map = {"April 2023": 4, "May 2023": 5, "June 2023": 6, "July 2023": 7, "August 2023": 8}
-            trend_df = df.groupby("Month")["Plan Cost"].sum().reset_index()
-            trend_df['Sort'] = trend_df['Month'].map(month_map)
-            trend_df = trend_df.sort_values('Sort')
-            st.line_chart(trend_df, x="Month", y="Plan Cost")
+            df['Sort'] = df['Month'].map(month_map)
+            df = df.sort_values('Sort')
+            
+            st.line_chart(df, x="Month", y="Plan Cost")
+            st.bar_chart(df.groupby("Cohort")["Plan Cost"].sum())
             
         with tab2:
-            st.bar_chart(cohort_spend)
-            
-        with tab3:
-            st.warning("Verify the extracted numbers below:")
+            st.write("This table shows the SUM of Retail + Mail for each cohort.")
             st.data_editor(df, num_rows="dynamic")
-
     else:
-        st.error("Could not detect data. The PDF layout might be too unusual.")
+        st.error("No data found.")
