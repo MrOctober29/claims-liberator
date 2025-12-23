@@ -18,65 +18,120 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# --- BACKEND ENGINE (The Extraction Logic) ---
+# --- HELPER FUNCTIONS ---
+def clean_money(value):
+    """Converts '$1,234.56' or '1,234' to a float."""
+    if not value: return 0.0
+    # Remove $, commas, and parentheses for negatives
+    clean = str(value).replace('$', '').replace(',', '').replace(' ', '')
+    if '(' in clean or ')' in clean:
+        clean = '-' + clean.replace('(', '').replace(')', '')
+    try:
+        return float(clean)
+    except ValueError:
+        return 0.0
+
+# --- BACKEND ENGINE ---
 @st.cache_data
 def parse_pdf(uploaded_file):
     extracted_data = []
+    
+    # These keywords help us identify which rows matter
     cohort_keywords = [
         "HMO Actives", "HMO Retirees", "Horizon/Aetna PPO Actives", 
         "Horizon/Aetna PPO Retirees", "Employee Freestanding Actives", 
-        "Employer Group Waiver Plan"
+        "Employer Group Waiver Plan", "Employee Freestanding Retirees",
+        "Total", "HMO Total", "Horizon/Aetna PPO Total", "Employee Freestanding Total"
     ]
     
     with pdfplumber.open(uploaded_file) as pdf:
         current_month = None
+        
         for page in pdf.pages:
             text = page.extract_text()
             
-            # Detect Month (e.g., "April 2023")
+            # 1. Detect Month (e.g., "April 2023")
             month_match = re.search(r'(January|February|March|April|May|June|July|August|September|October|November|December)\s\d{4}', text)
             if month_match:
                 current_month = month_match.group(0)
-
+            
+            # 2. Extract Tables
             tables = page.extract_tables()
+            
             for table in tables:
                 for row in table:
-                    clean_row = [str(x).replace('\n', ' ').strip() if x else '' for x in row]
-                    if not clean_row: continue
+                    # Clean None values to empty strings
+                    raw_row = [str(cell) if cell is not None else "" for cell in row]
                     
-                    row_label = clean_row[0]
-                    matched_cohort = next((c for c in cohort_keywords if c in row_label), None)
+                    if not raw_row: continue
                     
-                    # Logic specifically for the Old Bridge PDF structure
-                    if matched_cohort and current_month:
-                        try:
-                            # We grab the last few columns which consistently hold the Totals in this PDF format
-                            # Note: In a production app, we would make column detection more dynamic
-                            entry = {
-                                "Month": current_month,
-                                "Cohort": matched_cohort,
-                                "Scripts": clean_row[-3],      # 3rd from last
-                                "Gross Cost": clean_row[-2],   # 2nd from last
-                                "Plan Cost": clean_row[-1]     # Last column
-                            }
-                            extracted_data.append(entry)
-                        except IndexError:
-                            continue
+                    # --- THE FIX: EXPLODE STACKED ROWS ---
+                    # Sometimes one row contains multiple lines separated by \n
+                    # We split the first column to see how many "sub-rows" exist.
+                    first_col_lines = raw_row[0].split('\n')
+                    num_sub_rows = len(first_col_lines)
+                    
+                    # Create empty sub-rows
+                    sub_rows = [[] for _ in range(num_sub_rows)]
+                    
+                    # Distribute the data from each cell into the sub-rows
+                    for cell_text in raw_row:
+                        # Split this cell by newline
+                        parts = cell_text.split('\n')
+                        
+                        # Pad with empty strings if this cell has fewer lines than the first column
+                        # (Common in empty number columns)
+                        while len(parts) < num_sub_rows:
+                            parts.append("")
+                        
+                        # Assign parts to their respective sub-row
+                        for i in range(num_sub_rows):
+                            sub_rows[i].append(parts[i])
                             
+                    # --- PROCESS EACH EXPLODED ROW ---
+                    for clean_row in sub_rows:
+                        # Clean up whitespace
+                        clean_row = [c.strip() for c in clean_row]
+                        row_label = clean_row[0]
+                        
+                        # Check if this is a row we want
+                        matched_cohort = next((c for c in cohort_keywords if c in row_label), None)
+                        
+                        if matched_cohort and current_month:
+                            try:
+                                # We target the LAST 3 columns for the "Total" section stats.
+                                # Structure: ... | Total Scripts | Gross Cost | Member Cost | Plan Cost |
+                                # Note: Sometimes columns merge. We look for the last valid numbers.
+                                
+                                # Safety: ensure we have enough columns
+                                if len(clean_row) < 4: continue
+
+                                plan_cost = clean_money(clean_row[-1])
+                                member_cost = clean_money(clean_row[-2])
+                                gross_cost = clean_money(clean_row[-3])
+                                
+                                # Scripts is often the 4th from last, or 3rd from last if Member/Gross merged.
+                                # For this specific report, let's grab the column preceding the costs
+                                scripts = clean_money(clean_row[-4]) if len(clean_row) > 4 else 0
+
+                                entry = {
+                                    "Month": current_month,
+                                    "Cohort": matched_cohort,
+                                    "Scripts": scripts,
+                                    "Gross Cost": gross_cost,
+                                    "Member Cost": member_cost,
+                                    "Plan Cost": plan_cost
+                                }
+                                extracted_data.append(entry)
+                            except (ValueError, IndexError):
+                                continue
+
     df = pd.DataFrame(extracted_data)
-    
-    # Cleaning: Remove $ and ,
-    cols_to_clean = ["Scripts", "Gross Cost", "Plan Cost"]
-    for col in cols_to_clean:
-        if col in df.columns:
-            df[col] = df[col].astype(str).str.replace('$', '', regex=False).str.replace(',', '', regex=False).str.replace('(', '-', regex=False).str.replace(')', '', regex=False)
-            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-            
     return df
 
 # --- UI: SIDEBAR ---
 with st.sidebar:
-    st.header("Claims Liberator v1.0")
+    st.header("Claims Liberator v1.1")
     st.info("Upload a Monthly Experience Report PDF to begin.")
     st.markdown("---")
     st.caption("Proof of Concept for: Old Bridge Twp")
@@ -84,59 +139,49 @@ with st.sidebar:
 # --- UI: MAIN AREA ---
 st.title("💊 Claims Analysis Dashboard")
 
-# 1. THE DROP ZONE
 uploaded_file = st.file_uploader("Drag & Drop your PDF Report here", type="pdf")
 
 if uploaded_file:
-    # 2. PROCESSING
-    with st.spinner('Parsing PDF structure... extracting tables...'):
+    with st.spinner('Processing stacked data rows...'):
         df = parse_pdf(uploaded_file)
     
     if not df.empty:
         st.success("Extraction Complete!")
         
-        # 3. THE SANITY CHECK (Validation Mode)
-        with st.expander("🔍 Sanity Check (Validate Data)", expanded=True):
-            col1, col2 = st.columns([1, 2])
-            with col1:
-                st.markdown("### Source Validation")
-                st.write("Review the extracted numbers against your PDF.")
-                st.warning("⚠️ If you see a discrepancy, you can edit the values in the grid directly.")
-            with col2:
-                # Interactive Data Editor - User can fix numbers here!
-                edited_df = st.data_editor(df, num_rows="dynamic")
+        # Filter out "Total" rows for the charts (to avoid double counting)
+        chart_df = df[~df['Cohort'].str.contains("Total")]
         
-        # 4. THE PAYOFF (Visualization)
-        st.divider()
-        st.subheader("📈 Monthly Cost Analysis")
+        # --- METRICS ---
+        total_spend = chart_df["Plan Cost"].sum()
+        total_scripts = chart_df["Scripts"].sum()
         
-        # Metrics Row
-        total_spend = edited_df["Plan Cost"].sum()
-        total_scripts = edited_df["Scripts"].sum()
-        top_cohort = edited_df.groupby("Cohort")["Plan Cost"].sum().idxmax()
+        # Find top cost driver
+        cohort_spend = chart_df.groupby("Cohort")["Plan Cost"].sum()
+        top_cohort = cohort_spend.idxmax() if not cohort_spend.empty else "N/A"
         
         m1, m2, m3 = st.columns(3)
         m1.metric("Total Plan Spend", f"${total_spend:,.2f}")
         m2.metric("Total Scripts", f"{int(total_scripts):,}")
-        m3.metric("Highest Cost Cohort", top_cohort)
+        m3.metric("Top Cost Driver", top_cohort)
         
-        # Charts
-        tab1, tab2 = st.tabs(["Spend Trend", "Cohort Breakdown"])
+        # --- TABS ---
+        tab1, tab2, tab3 = st.tabs(["Spend Trend", "Cohort Breakdown", "Raw Data"])
         
         with tab1:
-            # Aggregate by Month
-            trend_data = edited_df.groupby("Month")["Plan Cost"].sum().reset_index()
-            # Sort months chronologically (simple logic for POC)
-            months_order = ["April 2023", "May 2023", "June 2023", "July 2023", "August 2023"]
-            trend_data["Month"] = pd.Categorical(trend_data["Month"], categories=months_order, ordered=True)
-            trend_data = trend_data.sort_values("Month")
-            
-            st.line_chart(trend_data, x="Month", y="Plan Cost")
+            st.subheader("Monthly Plan Cost")
+            # Sort by month logic
+            month_order = ["April 2023", "May 2023", "June 2023", "July 2023", "August 2023"]
+            trend_df = chart_df.groupby("Month")["Plan Cost"].sum().reindex(month_order).reset_index()
+            st.line_chart(trend_df, x="Month", y="Plan Cost")
             
         with tab2:
-            # Aggregate by Cohort
-            cohort_data = edited_df.groupby("Cohort")["Plan Cost"].sum()
-            st.bar_chart(cohort_data)
+            st.subheader("Cost by Cohort")
+            st.bar_chart(cohort_spend)
+            
+        with tab3:
+            st.markdown("### Validation Grid")
+            st.warning("You can edit values below if needed.")
+            edited_df = st.data_editor(df, num_rows="dynamic")
 
     else:
-        st.error("Could not find recognizable data tables. Please check the PDF format.")
+        st.error("No data found. The PDF format might have changed.")
