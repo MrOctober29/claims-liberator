@@ -10,8 +10,14 @@ st.set_page_config(page_title="Claims Liberator", layout="wide")
 # --- CUSTOM CSS FOR "CREATIVE" UI ---
 st.markdown("""
     <style>
-    .big-font { font-size: 24px !important; font-weight: bold; color: #2c3e50; }
-    .stMetric { background-color: #f8f9fa; padding: 15px; border-radius: 10px; border: 1px solid #e9ecef; }
+    .big-font { font-size: 24px !important; font-weight: bold; }
+    /* This fixes the white-on-white issue by using a semi-transparent background */
+    .stMetric { 
+        background-color: rgba(255, 255, 255, 0.05); 
+        padding: 15px; 
+        border-radius: 10px; 
+        border: 1px solid rgba(255, 255, 255, 0.1); 
+    }
     </style>
     """, unsafe_allow_html=True)
 
