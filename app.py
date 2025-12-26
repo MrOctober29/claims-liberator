@@ -1,37 +1,33 @@
 import streamlit as st
 import pdfplumber
 import pandas as pd
+import plotly.express as px
 import re
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Claims Liberator", layout="wide")
 
+# --- CUSTOM CSS FOR "CREATIVE" UI ---
+st.markdown("""
+    <style>
+    .big-font { font-size: 24px !important; font-weight: bold; color: #2c3e50; }
+    .stMetric { background-color: #f8f9fa; padding: 15px; border-radius: 10px; border: 1px solid #e9ecef; }
+    </style>
+    """, unsafe_allow_html=True)
+
 # --- HELPER FUNCTIONS ---
 def clean_money_value(val_str):
-    """
-    Parses money strings. 
-    Crucial: splits by newline first to avoid the '0\n345' -> '0345' concatenation bug.
-    """
     if not val_str: return 0.0
-    # If a cell somehow still has newlines, take the last value (usually the total or plan cost)
-    # or the first valid one. But our main logic should handle splitting before this.
-    if '\n' in str(val_str):
-        val_str = str(val_str).split('\n')[-1]
-        
+    if '\n' in str(val_str): val_str = str(val_str).split('\n')[-1]
     clean = str(val_str).replace('$', '').replace(',', '').replace(' ', '')
-    if '(' in clean or ')' in clean:
-        clean = '-' + clean.replace('(', '').replace(')', '')
-    try:
-        return float(clean)
-    except ValueError:
-        return 0.0
+    if '(' in clean or ')' in clean: clean = '-' + clean.replace('(', '').replace(')', '')
+    try: return float(clean)
+    except ValueError: return 0.0
 
-# --- BACKEND ENGINE ---
+# --- BACKEND ENGINE (v1.4 Logic) ---
 @st.cache_data
 def parse_pdf(uploaded_file):
     extracted_data = []
-    
-    # Accurate keywords based on Screenshot 3
     cohort_keywords = [
         "HMO Actives", "HMO Retirees", 
         "Horizon / Aetna PPO Actives", "Horizon/Aetna PPO Actives",
@@ -42,155 +38,150 @@ def parse_pdf(uploaded_file):
     
     with pdfplumber.open(uploaded_file) as pdf:
         current_month = None
-        
         for page in pdf.pages:
             text = page.extract_text()
-            
-            # 1. Detect Month
             month_match = re.search(r'(January|February|March|April|May|June|July|August|September|October|November|December)\s\d{4}', text)
-            if month_match:
-                current_month = month_match.group(0)
+            if month_match: current_month = month_match.group(0)
             
-            # 2. Extract Tables (Text Strategy is VITAL for columns)
-            tables = page.extract_tables(table_settings={
-                "vertical_strategy": "text", 
-                "horizontal_strategy": "text",
-                "snap_tolerance": 4,
-            })
+            # Text strategy is crucial for separation
+            tables = page.extract_tables(table_settings={"vertical_strategy": "text", "horizontal_strategy": "text", "snap_tolerance": 4})
             
-            # 3. Strategy: Find the "TOTAL" table. 
-            # In the PDF structure (Screenshot 3), there are 3 tables: Mail, Retail, Total.
-            # We want the LAST valid table that contains data.
-            
+            # Find the "TOTAL" table (usually last)
             target_table = None
-            
-            # Look backwards from the last table
             for table in reversed(tables):
-                # Check if this table looks like the summary table
-                # It usually has "Total" in the header or high rows
-                content_str = str(table).lower()
-                if "hmo actives" in content_str: 
+                if "hmo actives" in str(table).lower(): 
                     target_table = table
                     break
             
             if not target_table: continue
 
-            # 4. Parse the Target Table
             for row in target_table:
-                # Basic cleanup
                 raw_row = [str(cell) if cell is not None else "" for cell in row]
                 if not raw_row: continue
                 
-                # --- EXPLODE LOGIC (Fixes "Understated" / Missing Stacked Rows) ---
-                # "Horizon PPO Actives" and "Retirees" are often in the same cell, separated by \n.
-                # We split the first column (Label) to see how many lines we have.
-                
+                # Explode Logic for Stacked Rows
                 label_col = raw_row[0]
                 lines_in_row = label_col.count('\n') + 1
                 
-                # We iterate through each "virtual line" inside this physical row
                 for i in range(lines_in_row):
                     try:
-                        # 1. Get the Label for this line
                         label_parts = label_col.split('\n')
                         if i >= len(label_parts): continue
                         current_label = label_parts[i].strip()
                         
-                        # Fuzzy match check
                         matched_cohort = next((c for c in cohort_keywords if c in current_label or current_label in c), None)
-                        
-                        # Specific fix for "Horizon / Aetna PPO" splitting weirdly
-                        if not matched_cohort and "Retirees" in current_label and "PPO" in label_col:
-                            matched_cohort = "Horizon / Aetna PPO Retirees"
-                        if not matched_cohort and "Actives" in current_label and "PPO" in label_col:
-                            matched_cohort = "Horizon / Aetna PPO Actives"
+                        if not matched_cohort and "Retirees" in current_label and "PPO" in label_col: matched_cohort = "Horizon / Aetna PPO Retirees"
+                        if not matched_cohort and "Actives" in current_label and "PPO" in label_col: matched_cohort = "Horizon / Aetna PPO Actives"
 
                         if matched_cohort and current_month:
-                            # 2. Extract Values for this specific line `i`
-                            # We need to grab the i-th segment of the number cells too.
-                            
                             def get_val(col_idx, line_idx):
                                 if col_idx >= len(raw_row): return "0"
-                                cell_val = raw_row[col_idx]
-                                parts = cell_val.split('\n')
-                                # If the number column has fewer lines than the label column,
-                                # it often means the numbers are aligned to the bottom or top.
-                                # We try to match index, otherwise grab the nearest.
-                                if line_idx < len(parts):
-                                    return parts[line_idx]
+                                parts = raw_row[col_idx].split('\n')
+                                if line_idx < len(parts): return parts[line_idx]
                                 return "0"
-
-                            # COLUMN MAPPING (Based on "TOTAL" table in Screenshot 3)
-                            # The table has 3 sections: Brand, Generic, Total.
-                            # We want the LAST section (Total).
-                            # Structure: [Labels] ... [Brand Cols] ... [Generic Cols] ... [Total Scripts] [Total Gross] [Total Mem] [Total Plan]
                             
-                            # We reliably grab from the END of the list:
-                            # -1: Total Plan Cost
-                            # -2: Total Member Cost
-                            # -3: Total Gross Cost
-                            # -4: Total Scripts
-                            
-                            plan_cost = clean_money_value(get_val(-1, i))
-                            member_cost = clean_money_value(get_val(-2, i))
-                            gross_cost = clean_money_value(get_val(-3, i))
-                            scripts = clean_money_value(get_val(-4, i))
-                            
-                            # Sanity filter: If we grabbed a header row by accident (Cost is 0, Scripts is 0)
-                            # we might want to skip, but legitimate 0s exist. 
-                            # The keyword match is our primary filter.
-
-                            entry = {
+                            extracted_data.append({
                                 "Month": current_month,
                                 "Cohort": matched_cohort,
-                                "Scripts": scripts,
-                                "Gross Cost": gross_cost,
-                                "Member Cost": member_cost,
-                                "Plan Cost": plan_cost
-                            }
-                            extracted_data.append(entry)
-                    except Exception:
-                        continue
+                                "Scripts": clean_money_value(get_val(-4, i)),
+                                "Gross Cost": clean_money_value(get_val(-3, i)),
+                                "Member Cost": clean_money_value(get_val(-2, i)),
+                                "Plan Cost": clean_money_value(get_val(-1, i))
+                            })
+                    except Exception: continue
 
-    df = pd.DataFrame(extracted_data)
-    return df
+    return pd.DataFrame(extracted_data)
 
-# --- UI ---
-st.title("Claims Liberator v1.4")
-st.caption("Targeting 'TOTAL' Table & Exploding Stacked Rows")
+# --- NEW CREATIVE UI ---
+st.title("💊 Claims Liberator")
+st.markdown("##### Turn dense PDF reports into interactive insights.")
 
-uploaded_file = st.file_uploader("Drag & Drop PDF", type="pdf")
+uploaded_file = st.file_uploader("", type="pdf", label_visibility="collapsed")
 
 if uploaded_file:
-    with st.spinner('Analyzing Tables...'):
+    with st.spinner('Parsing PDF...'):
         df = parse_pdf(uploaded_file)
     
     if not df.empty:
-        # Sort Months
+        # 1. DATA PREP
         month_map = {"April 2023": 4, "May 2023": 5, "June 2023": 6, "July 2023": 7, "August 2023": 8}
         df['Sort'] = df['Month'].map(month_map)
         df = df.sort_values('Sort')
-
-        # Totals
+        
+        # 2. TOP LEVEL METRICS
         total_spend = df["Plan Cost"].sum()
-        total_scripts = df["Scripts"].sum()
+        avg_monthly = total_spend / df["Month"].nunique()
+        top_cohort_name = df.groupby("Cohort")["Plan Cost"].sum().idxmax()
         
-        c1, c2 = st.columns(2)
-        c1.metric("Total Plan Spend", f"${total_spend:,.2f}")
-        c2.metric("Total Scripts", f"{int(total_scripts):,}")
+        st.markdown("---")
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Total Spend (Period)", f"${total_spend:,.0f}", help="Sum of Plan Cost from all tables")
+        col2.metric("Avg. Monthly Spend", f"${avg_monthly:,.0f}", help="Total Spend / Count of Months")
+        col3.metric("Top Cost Driver", top_cohort_name)
+        st.markdown("---")
+
+        # 3. INTERACTIVE BAR CHARTS
         
-        # Tabs
-        tab1, tab2 = st.tabs(["Analysis", "Validation Grid"])
+        # CHART A: Monthly Spend (Stacked)
+        st.subheader("📊 Spend Composition by Month")
+        st.caption("Hover over the bars to see the exact split between cohorts.")
         
-        with tab1:
-            st.subheader("Monthly Plan Cost")
-            st.line_chart(df, x="Month", y="Plan Cost")
+        fig_monthly = px.bar(
+            df, 
+            x="Month", 
+            y="Plan Cost", 
+            color="Cohort", 
+            title="Monthly Trend",
+            text_auto='.2s', # Shows compact numbers (e.g. 200k) on bars
+            color_discrete_sequence=px.colors.qualitative.Prism # Nice professional colors
+        )
+        # Clean up the chart look
+        fig_monthly.update_layout(xaxis_title="", yaxis_title="Plan Cost ($)", legend_title="")
+        st.plotly_chart(fig_monthly, use_container_width=True)
+        
+        col_left, col_right = st.columns([1, 1])
+        
+        with col_left:
+            # CHART B: Cohort Leaderboard (Horizontal)
+            st.subheader("🏆 Cost by Cohort")
+            cohort_df = df.groupby("Cohort")["Plan Cost"].sum().reset_index().sort_values("Plan Cost", ascending=True)
             
-            st.subheader("Cost by Cohort")
-            st.bar_chart(df.groupby("Cohort")["Plan Cost"].sum())
+            fig_cohort = px.bar(
+                cohort_df, 
+                x="Plan Cost", 
+                y="Cohort", 
+                orientation='h', # Horizontal bars are easier to read for long names
+                text_auto='.2s',
+                color="Plan Cost",
+                color_continuous_scale="Blues"
+            )
+            fig_cohort.update_layout(xaxis_title="Total Spend ($)", yaxis_title="", coloraxis_showscale=False)
+            st.plotly_chart(fig_cohort, use_container_width=True)
+
+        with col_right:
+            # CHART C: Script Volume
+            st.subheader("💊 Script Volume")
+            script_df = df.groupby("Month")["Scripts"].sum().reset_index()
             
-        with tab2:
-            st.write("Data extracted from the 'TOTAL' summary table of each month.")
-            st.data_editor(df, num_rows="dynamic")
+            fig_scripts = px.bar(
+                script_df,
+                x="Month",
+                y="Scripts",
+                text_auto=True,
+                color_discrete_sequence=["#FF4B4B"] # Streamlit Red for contrast
+            )
+            fig_scripts.update_layout(xaxis_title="", yaxis_title="Total Scripts")
+            st.plotly_chart(fig_scripts, use_container_width=True)
+
+        # 4. DATA EXPLORER
+        with st.expander("🔍 Drill Down into Raw Data"):
+            st.info("Select specific cohorts to filter the data grid.")
+            selected_cohorts = st.multiselect("Filter by Cohort", df["Cohort"].unique(), default=df["Cohort"].unique())
+            filtered_df = df[df["Cohort"].isin(selected_cohorts)]
+            st.dataframe(filtered_df, use_container_width=True)
+            
     else:
-        st.error("No data found.")
+        st.error("No data extracted. Please check the PDF format.")
+elif not uploaded_file:
+    # Empty state placeholder
+    st.info("👆 Upload your 'Old Bridge' PDF to see the magic happen.")
