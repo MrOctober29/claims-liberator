@@ -7,16 +7,19 @@ import re
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Broker Intelligence Suite", layout="wide")
 
-# --- CUSTOM CSS (Fixed for Dark Mode) ---
+# --- CUSTOM CSS ---
 st.markdown("""
     <style>
     .big-font { font-size: 24px !important; font-weight: bold; }
-    /* Transparent cards for Dark/Light mode compatibility */
     .stMetric { 
         background-color: rgba(255, 255, 255, 0.05); 
         padding: 15px; 
         border-radius: 10px; 
         border: 1px solid rgba(255, 255, 255, 0.1); 
+    }
+    /* Sidebar styling to differentiate it */
+    [data-testid="stSidebar"] {
+        background-color: rgba(255, 255, 255, 0.02);
     }
     </style>
     """, unsafe_allow_html=True)
@@ -30,34 +33,19 @@ def clean_money_value(val_str):
     try: return float(clean)
     except ValueError: return 0.0
 
-# --- THE SMART ROUTER (Traffic Controller) ---
+# --- SMART ROUTER ---
 def detect_document_type(uploaded_file):
-    """
-    Peeks at the file content to guess the report type.
-    Returns: 'RX', 'GEO', 'CENSUS', or 'UNKNOWN'
-    """
     filename = uploaded_file.name.lower()
-    
-    # 1. Check Extension for Census (usually Excel/CSV)
-    if filename.endswith('.xlsx') or filename.endswith('.csv'):
-        return 'CENSUS'
-    
-    # 2. Check PDF Content
+    if filename.endswith('.xlsx') or filename.endswith('.csv'): return 'CENSUS'
     try:
         with pdfplumber.open(uploaded_file) as pdf:
             first_page_text = pdf.pages[0].extract_text() or ""
-            # Keywords to identify Rx Reports
-            if "Ingredient Cost" in first_page_text or "Plan Cost" in first_page_text:
-                return 'RX'
-            # Keywords for GeoAccess (Adjust based on your actual Geo reports)
-            if "GeoAccess" in first_page_text or "Distance" in first_page_text or "Access Analysis" in first_page_text:
-                return 'GEO'
-    except:
-        return 'UNKNOWN'
-        
+            if "Ingredient Cost" in first_page_text or "Plan Cost" in first_page_text: return 'RX'
+            if "GeoAccess" in first_page_text or "Distance" in first_page_text: return 'GEO'
+    except: return 'UNKNOWN'
     return 'UNKNOWN'
 
-# --- ENGINE 1: RX PARSER (The logic we perfected) ---
+# --- ENGINE: RX PARSER ---
 @st.cache_data
 def run_rx_parser(uploaded_file):
     extracted_data = []
@@ -118,73 +106,103 @@ def run_rx_parser(uploaded_file):
                     except Exception: continue
     return pd.DataFrame(extracted_data)
 
-# --- ENGINE 2: GEOACCESS PARSER (Placeholder) ---
-def run_geo_parser(uploaded_file):
-    # FUTURE WORK: This will parse the GeoAccess PDF structure
-    st.info("GeoAccess Logic Initialized. Parser coming in next sprint.")
-    # Returning dummy data so you can see the UI switch
-    return pd.DataFrame({
-        "Zip Code": ["07747", "08857", "07001"],
-        "City": ["Old Bridge", "Matawan", "Avenel"],
-        "Access %": [98, 95, 82],
-        "Gap": [False, False, True]
-    })
+# --- SIDEBAR: CONTEXT SETTINGS ---
+st.sidebar.title("⚙️ Analysis Context")
+user_role = st.sidebar.radio("User Persona", ["Benefit Advisor", "Underwriter"], index=0)
+funding_type = st.sidebar.selectbox("Funding Type", ["Fully Insured", "Level Funded", "Traditional Stop Loss"])
 
-# --- UI: MAIN AREA ---
+if user_role == "Underwriter":
+    isl_threshold = st.sidebar.number_input("ISL Threshold ($)", value=50000, step=10000)
+    st.sidebar.info(f"Targeting claimants > 50% of ${isl_threshold:,}")
+
+# --- MAIN UI ---
 st.title("🛡️ Broker Intelligence Suite")
-st.markdown("##### Upload any report (Rx, GeoAccess, Census) - We'll figure it out.")
 
-uploaded_file = st.file_uploader("", type=["pdf", "xlsx", "csv"], label_visibility="collapsed")
+uploaded_file = st.file_uploader("Upload Report (Rx, Geo, Census)", type=["pdf", "xlsx", "csv"], label_visibility="visible")
 
 if uploaded_file:
-    with st.spinner('Analyzing Document Structure...'):
-        # 1. DETECT TYPE
-        doc_type = detect_document_type(uploaded_file)
+    # 1. DETECT
+    doc_type = detect_document_type(uploaded_file)
     
-    # 2. ROUTE TO CORRECT ENGINE
+    # 2. PARSE RX
     if doc_type == 'RX':
-        st.success(f"📂 Document Identified: **Pharmacy Experience Report**")
         df = run_rx_parser(uploaded_file)
-        
         if not df.empty:
-            # --- RX DASHBOARD ---
+            # Common Data Prep
             month_map = {"April 2023": 4, "May 2023": 5, "June 2023": 6, "July 2023": 7, "August 2023": 8}
             df['Sort'] = df['Month'].map(month_map)
             df = df.sort_values('Sort')
-            
             total_spend = df["Plan Cost"].sum()
-            avg_monthly = total_spend / df["Month"].nunique()
-            top_cohort_name = df.groupby("Cohort")["Plan Cost"].sum().idxmax()
             
-            st.markdown("---")
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Total Spend", f"${total_spend:,.0f}")
-            c2.metric("Avg Monthly", f"${avg_monthly:,.0f}")
-            c3.metric("Top Cost Driver", top_cohort_name)
-            
-            st.subheader("📊 Spend Composition")
-            fig_monthly = px.bar(df, x="Month", y="Plan Cost", color="Cohort", 
-                                 text_auto='.2s', color_discrete_sequence=px.colors.qualitative.Prism)
-            fig_monthly.update_layout(xaxis_title="", yaxis_title="Plan Cost ($)", legend_title="")
-            st.plotly_chart(fig_monthly, use_container_width=True)
-
-            col_left, col_right = st.columns(2)
-            with col_left:
-                st.subheader("🏆 Cohort Costs")
+            # ---------------------------
+            # VIEW 1: BENEFIT ADVISOR
+            # ---------------------------
+            if user_role == "Benefit Advisor":
+                st.success(f"📂 Report Loaded: Pharmacy Experience ({funding_type} Context)")
+                
+                # Big Metrics
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Total Spend", f"${total_spend:,.0f}")
+                c2.metric("Avg Monthly", f"${total_spend / df['Month'].nunique():,.0f}")
+                c3.metric("Top Cost Driver", df.groupby("Cohort")["Plan Cost"].sum().idxmax())
+                
+                # Visuals
+                st.subheader("📊 Executive Summary")
+                fig_monthly = px.bar(df, x="Month", y="Plan Cost", color="Cohort", 
+                                     text_auto='.2s', color_discrete_sequence=px.colors.qualitative.Prism)
+                st.plotly_chart(fig_monthly, use_container_width=True)
+                
+                st.subheader("🏆 Cohort Analysis")
                 cohort_df = df.groupby("Cohort")["Plan Cost"].sum().reset_index().sort_values("Plan Cost")
                 fig_c = px.bar(cohort_df, x="Plan Cost", y="Cohort", orientation='h', text_auto='.2s')
                 st.plotly_chart(fig_c, use_container_width=True)
-            with col_right:
-                st.subheader("Data Grid")
-                st.dataframe(df, use_container_width=True, height=300)
-    
+
+            # ---------------------------
+            # VIEW 2: UNDERWRITER
+            # ---------------------------
+            elif user_role == "Underwriter":
+                st.warning(f"🔐 Underwriter Mode Active | Funding: {funding_type}")
+                
+                # Technical Metrics
+                col1, col2, col3, col4 = st.columns(4)
+                total_scripts = df["Scripts"].sum()
+                cost_per_script = total_spend / total_scripts if total_scripts > 0 else 0
+                
+                col1.metric("Gross Spend", f"${df['Gross Cost'].sum():,.0f}", help="Before Member Share")
+                col2.metric("Plan Spend", f"${total_spend:,.0f}", help="Net Employer Cost")
+                col3.metric("Member Share %", f"{(df['Member Cost'].sum() / df['Gross Cost'].sum()) * 100:.1f}%")
+                col4.metric("Cost Per Script", f"${cost_per_script:,.2f}")
+                
+                st.markdown("### 📉 Risk Analysis & Trend Anomalies")
+                
+                # Month-over-Month Variance Calculation
+                monthly_trend = df.groupby("Month")["Plan Cost"].sum().reset_index()
+                monthly_trend['Sort'] = monthly_trend['Month'].map(month_map)
+                monthly_trend = monthly_trend.sort_values('Sort')
+                monthly_trend['% Change'] = monthly_trend['Plan Cost'].pct_change() * 100
+                
+                st.dataframe(monthly_trend.style.format({"Plan Cost": "${:,.2f}", "% Change": "{:+.2f}%"}), use_container_width=True)
+                
+                # ISL / HCC Placeholder
+                st.markdown("### ⚠️ High Cost Claimant (HCC) / ISL Analysis")
+                if "Claimant ID" in df.columns:
+                    # Logic for ISL breach would go here
+                    pass
+                else:
+                    st.info(f"""
+                    **Aggregate Report Detected:** This file contains cohort-level data only. 
+                    Individual Stop Loss (ISL) breaches at the ${isl_threshold:,} level cannot be calculated.
+                    
+                    *Upload a Detailed Claims Report (CSV/Excel) to enable HCC detection.*
+                    """)
+                    
+                st.markdown("### 🔍 Raw Data Inspection")
+                st.dataframe(df, use_container_width=True)
+
+    # 3. OTHER DOC TYPES
     elif doc_type == 'GEO':
-        st.success(f"🌍 Document Identified: **GeoAccess Report**")
-        st.warning("🚧 The GeoAccess Parsing Engine is under construction. (Upload a sample to build it!)")
-        
+        st.info("GeoAccess Engine Loaded. (Upload sample to activate)")
     elif doc_type == 'CENSUS':
-        st.success(f"👥 Document Identified: **Member Census**")
-        st.warning("🚧 The Census Parsing Engine is under construction.")
-        
+        st.info("Census Engine Loaded. (Upload sample to activate)")
     else:
-        st.error("Unknown Document Type. Please upload a standard Rx Report, GeoAccess PDF, or Census Excel.")
+        st.error("Unknown File Type.")
