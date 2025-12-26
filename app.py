@@ -5,13 +5,13 @@ import plotly.express as px
 import re
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="Claims Liberator", layout="wide")
+st.set_page_config(page_title="Broker Intelligence Suite", layout="wide")
 
-# --- CUSTOM CSS FOR "CREATIVE" UI ---
+# --- CUSTOM CSS (Fixed for Dark Mode) ---
 st.markdown("""
     <style>
     .big-font { font-size: 24px !important; font-weight: bold; }
-    /* This fixes the white-on-white issue by using a semi-transparent background */
+    /* Transparent cards for Dark/Light mode compatibility */
     .stMetric { 
         background-color: rgba(255, 255, 255, 0.05); 
         padding: 15px; 
@@ -30,9 +30,36 @@ def clean_money_value(val_str):
     try: return float(clean)
     except ValueError: return 0.0
 
-# --- BACKEND ENGINE (v1.4 Logic) ---
+# --- THE SMART ROUTER (Traffic Controller) ---
+def detect_document_type(uploaded_file):
+    """
+    Peeks at the file content to guess the report type.
+    Returns: 'RX', 'GEO', 'CENSUS', or 'UNKNOWN'
+    """
+    filename = uploaded_file.name.lower()
+    
+    # 1. Check Extension for Census (usually Excel/CSV)
+    if filename.endswith('.xlsx') or filename.endswith('.csv'):
+        return 'CENSUS'
+    
+    # 2. Check PDF Content
+    try:
+        with pdfplumber.open(uploaded_file) as pdf:
+            first_page_text = pdf.pages[0].extract_text() or ""
+            # Keywords to identify Rx Reports
+            if "Ingredient Cost" in first_page_text or "Plan Cost" in first_page_text:
+                return 'RX'
+            # Keywords for GeoAccess (Adjust based on your actual Geo reports)
+            if "GeoAccess" in first_page_text or "Distance" in first_page_text or "Access Analysis" in first_page_text:
+                return 'GEO'
+    except:
+        return 'UNKNOWN'
+        
+    return 'UNKNOWN'
+
+# --- ENGINE 1: RX PARSER (The logic we perfected) ---
 @st.cache_data
-def parse_pdf(uploaded_file):
+def run_rx_parser(uploaded_file):
     extracted_data = []
     cohort_keywords = [
         "HMO Actives", "HMO Retirees", 
@@ -49,10 +76,7 @@ def parse_pdf(uploaded_file):
             month_match = re.search(r'(January|February|March|April|May|June|July|August|September|October|November|December)\s\d{4}', text)
             if month_match: current_month = month_match.group(0)
             
-            # Text strategy is crucial for separation
             tables = page.extract_tables(table_settings={"vertical_strategy": "text", "horizontal_strategy": "text", "snap_tolerance": 4})
-            
-            # Find the "TOTAL" table (usually last)
             target_table = None
             for table in reversed(tables):
                 if "hmo actives" in str(table).lower(): 
@@ -64,8 +88,6 @@ def parse_pdf(uploaded_file):
             for row in target_table:
                 raw_row = [str(cell) if cell is not None else "" for cell in row]
                 if not raw_row: continue
-                
-                # Explode Logic for Stacked Rows
                 label_col = raw_row[0]
                 lines_in_row = label_col.count('\n') + 1
                 
@@ -74,7 +96,6 @@ def parse_pdf(uploaded_file):
                         label_parts = label_col.split('\n')
                         if i >= len(label_parts): continue
                         current_label = label_parts[i].strip()
-                        
                         matched_cohort = next((c for c in cohort_keywords if c in current_label or current_label in c), None)
                         if not matched_cohort and "Retirees" in current_label and "PPO" in label_col: matched_cohort = "Horizon / Aetna PPO Retirees"
                         if not matched_cohort and "Actives" in current_label and "PPO" in label_col: matched_cohort = "Horizon / Aetna PPO Actives"
@@ -95,99 +116,75 @@ def parse_pdf(uploaded_file):
                                 "Plan Cost": clean_money_value(get_val(-1, i))
                             })
                     except Exception: continue
-
     return pd.DataFrame(extracted_data)
 
-# --- NEW CREATIVE UI ---
-st.title("💊 Claims Liberator")
-st.markdown("##### Turn dense PDF reports into interactive insights.")
+# --- ENGINE 2: GEOACCESS PARSER (Placeholder) ---
+def run_geo_parser(uploaded_file):
+    # FUTURE WORK: This will parse the GeoAccess PDF structure
+    st.info("GeoAccess Logic Initialized. Parser coming in next sprint.")
+    # Returning dummy data so you can see the UI switch
+    return pd.DataFrame({
+        "Zip Code": ["07747", "08857", "07001"],
+        "City": ["Old Bridge", "Matawan", "Avenel"],
+        "Access %": [98, 95, 82],
+        "Gap": [False, False, True]
+    })
 
-uploaded_file = st.file_uploader("", type="pdf", label_visibility="collapsed")
+# --- UI: MAIN AREA ---
+st.title("🛡️ Broker Intelligence Suite")
+st.markdown("##### Upload any report (Rx, GeoAccess, Census) - We'll figure it out.")
+
+uploaded_file = st.file_uploader("", type=["pdf", "xlsx", "csv"], label_visibility="collapsed")
 
 if uploaded_file:
-    with st.spinner('Parsing PDF...'):
-        df = parse_pdf(uploaded_file)
+    with st.spinner('Analyzing Document Structure...'):
+        # 1. DETECT TYPE
+        doc_type = detect_document_type(uploaded_file)
     
-    if not df.empty:
-        # 1. DATA PREP
-        month_map = {"April 2023": 4, "May 2023": 5, "June 2023": 6, "July 2023": 7, "August 2023": 8}
-        df['Sort'] = df['Month'].map(month_map)
-        df = df.sort_values('Sort')
+    # 2. ROUTE TO CORRECT ENGINE
+    if doc_type == 'RX':
+        st.success(f"📂 Document Identified: **Pharmacy Experience Report**")
+        df = run_rx_parser(uploaded_file)
         
-        # 2. TOP LEVEL METRICS
-        total_spend = df["Plan Cost"].sum()
-        avg_monthly = total_spend / df["Month"].nunique()
-        top_cohort_name = df.groupby("Cohort")["Plan Cost"].sum().idxmax()
-        
-        st.markdown("---")
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Total Spend (Period)", f"${total_spend:,.0f}", help="Sum of Plan Cost from all tables")
-        col2.metric("Avg. Monthly Spend", f"${avg_monthly:,.0f}", help="Total Spend / Count of Months")
-        col3.metric("Top Cost Driver", top_cohort_name)
-        st.markdown("---")
-
-        # 3. INTERACTIVE BAR CHARTS
-        
-        # CHART A: Monthly Spend (Stacked)
-        st.subheader("📊 Spend Composition by Month")
-        st.caption("Hover over the bars to see the exact split between cohorts.")
-        
-        fig_monthly = px.bar(
-            df, 
-            x="Month", 
-            y="Plan Cost", 
-            color="Cohort", 
-            title="Monthly Trend",
-            text_auto='.2s', # Shows compact numbers (e.g. 200k) on bars
-            color_discrete_sequence=px.colors.qualitative.Prism # Nice professional colors
-        )
-        # Clean up the chart look
-        fig_monthly.update_layout(xaxis_title="", yaxis_title="Plan Cost ($)", legend_title="")
-        st.plotly_chart(fig_monthly, use_container_width=True)
-        
-        col_left, col_right = st.columns([1, 1])
-        
-        with col_left:
-            # CHART B: Cohort Leaderboard (Horizontal)
-            st.subheader("🏆 Cost by Cohort")
-            cohort_df = df.groupby("Cohort")["Plan Cost"].sum().reset_index().sort_values("Plan Cost", ascending=True)
+        if not df.empty:
+            # --- RX DASHBOARD ---
+            month_map = {"April 2023": 4, "May 2023": 5, "June 2023": 6, "July 2023": 7, "August 2023": 8}
+            df['Sort'] = df['Month'].map(month_map)
+            df = df.sort_values('Sort')
             
-            fig_cohort = px.bar(
-                cohort_df, 
-                x="Plan Cost", 
-                y="Cohort", 
-                orientation='h', # Horizontal bars are easier to read for long names
-                text_auto='.2s',
-                color="Plan Cost",
-                color_continuous_scale="Blues"
-            )
-            fig_cohort.update_layout(xaxis_title="Total Spend ($)", yaxis_title="", coloraxis_showscale=False)
-            st.plotly_chart(fig_cohort, use_container_width=True)
-
-        with col_right:
-            # CHART C: Script Volume
-            st.subheader("💊 Script Volume")
-            script_df = df.groupby("Month")["Scripts"].sum().reset_index()
+            total_spend = df["Plan Cost"].sum()
+            avg_monthly = total_spend / df["Month"].nunique()
+            top_cohort_name = df.groupby("Cohort")["Plan Cost"].sum().idxmax()
             
-            fig_scripts = px.bar(
-                script_df,
-                x="Month",
-                y="Scripts",
-                text_auto=True,
-                color_discrete_sequence=["#FF4B4B"] # Streamlit Red for contrast
-            )
-            fig_scripts.update_layout(xaxis_title="", yaxis_title="Total Scripts")
-            st.plotly_chart(fig_scripts, use_container_width=True)
-
-        # 4. DATA EXPLORER
-        with st.expander("🔍 Drill Down into Raw Data"):
-            st.info("Select specific cohorts to filter the data grid.")
-            selected_cohorts = st.multiselect("Filter by Cohort", df["Cohort"].unique(), default=df["Cohort"].unique())
-            filtered_df = df[df["Cohort"].isin(selected_cohorts)]
-            st.dataframe(filtered_df, use_container_width=True)
+            st.markdown("---")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Total Spend", f"${total_spend:,.0f}")
+            c2.metric("Avg Monthly", f"${avg_monthly:,.0f}")
+            c3.metric("Top Cost Driver", top_cohort_name)
             
+            st.subheader("📊 Spend Composition")
+            fig_monthly = px.bar(df, x="Month", y="Plan Cost", color="Cohort", 
+                                 text_auto='.2s', color_discrete_sequence=px.colors.qualitative.Prism)
+            fig_monthly.update_layout(xaxis_title="", yaxis_title="Plan Cost ($)", legend_title="")
+            st.plotly_chart(fig_monthly, use_container_width=True)
+
+            col_left, col_right = st.columns(2)
+            with col_left:
+                st.subheader("🏆 Cohort Costs")
+                cohort_df = df.groupby("Cohort")["Plan Cost"].sum().reset_index().sort_values("Plan Cost")
+                fig_c = px.bar(cohort_df, x="Plan Cost", y="Cohort", orientation='h', text_auto='.2s')
+                st.plotly_chart(fig_c, use_container_width=True)
+            with col_right:
+                st.subheader("Data Grid")
+                st.dataframe(df, use_container_width=True, height=300)
+    
+    elif doc_type == 'GEO':
+        st.success(f"🌍 Document Identified: **GeoAccess Report**")
+        st.warning("🚧 The GeoAccess Parsing Engine is under construction. (Upload a sample to build it!)")
+        
+    elif doc_type == 'CENSUS':
+        st.success(f"👥 Document Identified: **Member Census**")
+        st.warning("🚧 The Census Parsing Engine is under construction.")
+        
     else:
-        st.error("No data extracted. Please check the PDF format.")
-elif not uploaded_file:
-    # Empty state placeholder
-    st.info("👆 Upload your 'Old Bridge' PDF to see the magic happen.")
+        st.error("Unknown Document Type. Please upload a standard Rx Report, GeoAccess PDF, or Census Excel.")
