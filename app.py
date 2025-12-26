@@ -145,11 +145,11 @@ def run_rx_parser(uploaded_file):
 # --- SIDEBAR: INTELLIGENCE HUB ---
 st.sidebar.header("🧠 Intelligence Hub")
 user_role = st.sidebar.radio("Active Persona", ["Benefit Advisor", "Underwriter"], index=0)
-funding_type = st.sidebar.selectbox("Funding Arrangement", ["Fully Insured", "Level Funded", "Traditional Stop Loss"])
 
 if user_role == "Underwriter":
     st.sidebar.markdown("---")
     st.sidebar.subheader("Risk Parameters")
+    # Kept ISL input as it's useful for Underwriter persona risk modeling, even without 'Funding Type' selection
     isl_threshold = st.sidebar.number_input("Spec Deductible ($)", value=50000, step=5000)
     trend_assump = st.sidebar.slider("Trend Assumption %", 0, 15, 8)
 
@@ -203,7 +203,7 @@ if uploaded_file:
             
             # --- VIEW: ADVISOR (THE STORYTELLER) ---
             if user_role == "Benefit Advisor":
-                st.success(f"📂 Report Processed: Pharmacy Experience | {funding_type}")
+                st.success(f"📂 Report Processed: Pharmacy Experience")
                 
                 # Custom Metric Cards
                 c1, c2, c3 = st.columns(3)
@@ -254,7 +254,7 @@ Best,
 
             # --- VIEW: UNDERWRITER (THE RISK RADAR) ---
             elif user_role == "Underwriter":
-                st.warning(f"🔐 Underwriter Workspace | ISL: ${isl_threshold:,}")
+                st.warning(f"🔐 Underwriter Workspace | Risk Analysis")
                 
                 col1, col2, col3, col4 = st.columns(4)
                 col1.metric("Gross Spend", f"${df['Gross Cost'].sum():,.0f}")
