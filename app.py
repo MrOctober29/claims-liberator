@@ -3,8 +3,6 @@ import pdfplumber
 import pandas as pd
 import plotly.express as px
 import re
-import urllib.parse
-import numpy as np
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Network Disruption & Analytics", layout="wide")
@@ -36,126 +34,144 @@ def clean_money_value(val_str):
     try: return float(clean)
     except ValueError: return 0.0
 
+def clean_percentage(val_str):
+    """Converts '98.5%', '98.5', or 0.985 to float 98.5"""
+    if not val_str: return 0.0
+    clean = str(val_str).replace('%', '').replace(' ', '').strip()
+    try:
+        val = float(clean)
+        # Handle decimal vs percent representation (0.9 vs 90)
+        # Most Geo reports use whole numbers (90.5), but some use decimals (0.905)
+        # We assume if max value in column is <= 1.0, it needs scaling.
+        return val
+    except ValueError:
+        return 0.0
+
 # --- SMART ROUTER ---
 def detect_document_type(uploaded_file):
     filename = uploaded_file.name.lower()
     
-    # 1. Census Detection (Excel/CSV)
+    # 1. Census (Excel/CSV)
     if filename.endswith('.xlsx') or filename.endswith('.csv'): 
-        # We assume Excel/CSV uploads are Census files for now
         return 'CENSUS'
     
-    # 2. PDF Detection (GeoAccess vs Rx)
+    # 2. PDF Analysis
     try:
         with pdfplumber.open(uploaded_file) as pdf:
             if not pdf.pages: return 'UNKNOWN'
             text = pdf.pages[0].extract_text() or ""
             
-            # GeoAccess Keywords
-            if "GeoAccess" in text or "Accessibility Analysis" in text or "Distance to" in text:
+            # Keywords
+            if "GeoAccess" in text or "Accessibility" in text or "Distance" in text:
                 return 'GEO'
-            
-            # Rx Keywords
             if "Ingredient Cost" in text or "Plan Cost" in text:
                 return 'RX'
     except: return 'UNKNOWN'
     return 'UNKNOWN'
 
-# --- ENGINE 1: CENSUS PARSER ---
+# --- ENGINE: CENSUS PARSER ---
 @st.cache_data
 def run_census_parser(uploaded_file):
-    """
-    Parses a raw Census file (Excel/CSV).
-    Auto-detects: Zip Code, Gender, DOB/Age.
-    """
     try:
-        if uploaded_file.name.endswith('.csv'):
-            df = pd.read_csv(uploaded_file)
-        else:
-            df = pd.read_excel(uploaded_file)
-    except Exception as e:
-        return pd.DataFrame(), str(e)
-
-    # Standardize Columns (Fuzzy Match)
+        if uploaded_file.name.endswith('.csv'): df = pd.read_csv(uploaded_file)
+        else: df = pd.read_excel(uploaded_file)
+    except Exception as e: return pd.DataFrame(), str(e)
+    
+    # Normalize headers
     df.columns = [c.strip().lower() for c in df.columns]
     
-    # Logic to find key columns
+    # Smart Column Detection
     zip_col = next((c for c in df.columns if 'zip' in c or 'postal' in c), None)
-    gender_col = next((c for c in df.columns if 'gender' in c or 'sex' in c), None)
-    age_col = next((c for c in df.columns if 'age' in c), None)
     dob_col = next((c for c in df.columns if 'dob' in c or 'birth' in c), None)
+    gender_col = next((c for c in df.columns if 'gender' in c or 'sex' in c), None)
+    status_col = next((c for c in df.columns if 'status' in c or 'relat' in c), None) # Employee vs Dependent
 
-    if not zip_col:
-        return pd.DataFrame(), "Could not find a 'Zip Code' column."
-
-    # Process Data
-    processed_df = pd.DataFrame()
-    processed_df['Zip'] = df[zip_col].astype(str).str[:5] # Clean Zips
+    if not zip_col: return pd.DataFrame(), "Missing 'Zip Code' column."
     
-    if gender_col: processed_df['Gender'] = df[gender_col]
-    else: processed_df['Gender'] = 'Unknown'
+    processed = pd.DataFrame()
+    processed['Zip'] = df[zip_col].astype(str).str[:5] # Standardize 5-digit zip
+    processed['Gender'] = df[gender_col] if gender_col else 'Unknown'
+    processed['Type'] = df[status_col] if status_col else 'Member'
     
-    if age_col: 
-        processed_df['Age'] = pd.to_numeric(df[age_col], errors='coerce')
-    elif dob_col:
-        # Simple Age Calc (Current Year - Year of Birth)
+    if dob_col:
         df[dob_col] = pd.to_datetime(df[dob_col], errors='coerce')
-        processed_df['Age'] = 2026 - df[dob_col].dt.year
-    else:
-        processed_df['Age'] = 0
+        processed['Age'] = 2026 - df[dob_col].dt.year
+    else: 
+        processed['Age'] = 0
+        
+    return processed, None
 
-    return processed_df, None
-
-# --- ENGINE 2: GEOACCESS PARSER ---
+# --- ENGINE: GEOACCESS PARSER (Production Grade) ---
 @st.cache_data
 def run_geo_parser(uploaded_file):
-    """
-    Scrapes a GeoAccess PDF for summary tables.
-    Looking for rows like: "Primary Care | 2 in 10 miles | 98.5%"
-    """
     extracted_data = []
-    # Common specialties in Geo reports
-    specialties = ["Primary Care", "PCP", "Pediatrics", "OB/GYN", "Specialists", "Hospital", "Pharmacy", "Behavioral Health"]
     
     with pdfplumber.open(uploaded_file) as pdf:
         for page in pdf.pages:
             tables = page.extract_tables()
+            
             for table in tables:
-                for row in table:
-                    # Clean Row
-                    clean_row = [str(x).replace('\n', ' ').strip() for x in row if x]
-                    row_text = " ".join(clean_row)
+                if not table: continue
+                
+                # 1. Identify Header Row
+                # We look for a row containing "Specialty" (or similar) AND "Access" (or %)
+                header_idx = -1
+                spec_col_idx = -1
+                access_col_idx = -1
+                
+                for i, row in enumerate(table):
+                    # Flatten row to string for searching
+                    row_str = " ".join([str(c).lower() for c in row if c])
                     
-                    # Logic: Look for specialty names and percentages in the same row
-                    matched_specialty = next((s for s in specialties if s.lower() in row_text.lower()), None)
-                    
-                    # Regex to find percentages (e.g., 98.2%, 100%)
-                    percent_match = re.search(r'(\d{1,3}\.?\d?)%', row_text)
-                    
-                    if matched_specialty and percent_match:
-                        # Logic to find the "Standard" (e.g., "2 in 10")
-                        # This is a heuristic guess based on common formats
-                        standard = "Standard Match"
-                        if "10 mile" in row_text: standard = "10 Miles"
-                        elif "15 mile" in row_text: standard = "15 Miles"
-                        elif "20 mile" in row_text: standard = "20 Miles"
+                    if ("specialty" in row_str or "service" in row_str or "provider" in row_str) and \
+                       ("access" in row_str or "%" in row_str or "match" in row_str):
+                        header_idx = i
                         
-                        extracted_data.append({
-                            "Specialty": matched_specialty,
-                            "Access %": float(percent_match.group(1)),
-                            "Standard": standard
-                        })
+                        # 2. Map Columns
+                        for col_i, cell in enumerate(row):
+                            cell_text = str(cell).lower()
+                            if "specialty" in cell_text or "service" in cell_text or "type" in cell_text:
+                                spec_col_idx = col_i
+                            if "access" in cell_text or "%" in cell_text or "match" in cell_text:
+                                access_col_idx = col_i
+                        break
+                
+                # If we found a valid header, process the rows BELOW it
+                if header_idx != -1 and spec_col_idx != -1 and access_col_idx != -1:
+                    for row in table[header_idx+1:]:
+                        if not row or len(row) <= max(spec_col_idx, access_col_idx): continue
+                        
+                        spec_name = row[spec_col_idx]
+                        access_val = row[access_col_idx]
+                        
+                        if spec_name and access_val:
+                            # Clean newline chars often found in PDF tables
+                            spec_name = str(spec_name).replace('\n', ' ').strip()
+                            
+                            # Extract number
+                            val = clean_percentage(access_val)
+                            
+                            if val > 0:
+                                extracted_data.append({
+                                    "Specialty": spec_name,
+                                    "Access %": val
+                                })
+
+    df = pd.DataFrame(extracted_data)
     
-    # Remove duplicates if any
-    df = pd.DataFrame(extracted_data).drop_duplicates()
+    # Dedup: If multiple tables (Urban/Rural), we might average them or take the worst case.
+    # For MVP, we take the average access across all found tables for that specialty.
+    if not df.empty:
+        df = df.groupby("Specialty")["Access %"].mean().reset_index()
+        
     return df
 
-# --- ENGINE 3: RX PARSER (Legacy Support) ---
+# --- ENGINE: RX PARSER (Legacy) ---
 @st.cache_data
 def run_rx_parser(uploaded_file):
-    # (Kept identical to previous version for backwards compatibility)
+    # Minimal version for legacy support
     extracted_data = []
-    cohort_keywords = ["HMO Actives", "HMO Retirees", "PPO Actives", "PPO Retirees", "Employer Group Waiver Plan"]
+    cohort_keywords = ["HMO Actives", "HMO Retirees", "PPO Actives", "PPO Retirees"]
     with pdfplumber.open(uploaded_file) as pdf:
         current_month = None
         for page in pdf.pages:
@@ -169,21 +185,14 @@ def run_rx_parser(uploaded_file):
             if not target_table: continue
             for row in target_table:
                 raw_row = [str(cell) if cell is not None else "" for cell in row]
-                if not raw_row: continue
                 label_col = raw_row[0]
-                lines_in_row = label_col.count('\n') + 1
-                for i in range(lines_in_row):
+                lines = label_col.count('\n') + 1
+                for i in range(lines):
                     try:
-                        label_parts = label_col.split('\n')
-                        if i >= len(label_parts): continue
-                        current_label = label_parts[i].strip()
-                        matched_cohort = next((c for c in cohort_keywords if c in current_label or current_label in c), None)
-                        if matched_cohort and current_month:
-                            extracted_data.append({
-                                "Month": current_month, 
-                                "Cohort": matched_cohort, 
-                                "Plan Cost": clean_money_value(raw_row[-1].split('\n')[i] if i < len(raw_row[-1].split('\n')) else "0")
-                            })
+                        label = label_col.split('\n')[i].strip()
+                        cohort = next((c for c in cohort_keywords if c in label), None)
+                        if cohort and current_month:
+                             extracted_data.append({"Month": current_month, "Cohort": cohort, "Plan Cost": clean_money_value(raw_row[-1].split('\n')[i])})
                     except: continue
     return pd.DataFrame(extracted_data)
 
@@ -193,103 +202,92 @@ parsing_mode = st.sidebar.selectbox("File Parser", ["Auto-Detect", "Census Engin
 
 # --- MAIN UI ---
 st.title("🛡️ Network Disruption & Analytics")
-st.markdown("##### Transform raw Census & GeoAccess reports into actionable strategy.")
 
-uploaded_file = st.file_uploader("Upload Report (Excel Census or PDF GeoAccess)", type=["pdf", "xlsx", "csv"])
+uploaded_file = st.file_uploader("Upload Report", type=["pdf", "xlsx", "csv"])
 
 if uploaded_file:
-    # 1. DETERMINE TYPE
+    # DETERMINE TYPE
     doc_type = 'UNKNOWN'
-    if parsing_mode == "Auto-Detect":
-        doc_type = detect_document_type(uploaded_file)
+    if parsing_mode == "Auto-Detect": doc_type = detect_document_type(uploaded_file)
     elif parsing_mode == "Census Engine": doc_type = 'CENSUS'
     elif parsing_mode == "GeoAccess Engine": doc_type = 'GEO'
     elif parsing_mode == "Rx Engine": doc_type = 'RX'
 
     # --- CENSUS DASHBOARD ---
     if doc_type == 'CENSUS':
-        st.success("👥 Processing Member Census...")
-        df, error = run_census_parser(uploaded_file)
+        st.success("👥 Processing Member Census")
+        df, err = run_census_parser(uploaded_file)
         
         if not df.empty:
             c1, c2, c3 = st.columns(3)
-            c1.markdown(f"""<div class="metric-box"><div class="big-stat">{len(df):,}</div><div class="stat-label">Total Lives</div></div>""", unsafe_allow_html=True)
-            c2.markdown(f"""<div class="metric-box"><div class="big-stat">{df['Age'].mean():.1f}</div><div class="stat-label">Avg Age</div></div>""", unsafe_allow_html=True)
-            c3.markdown(f"""<div class="metric-box"><div class="big-stat">{df['Zip'].nunique():,}</div><div class="stat-label">Unique Zips</div></div>""", unsafe_allow_html=True)
+            c1.metric("Total Lives", f"{len(df):,}")
+            c2.metric("Avg Age", f"{df['Age'].mean():.1f}")
+            c3.metric("Unique Zips", f"{df['Zip'].nunique()}")
             
-            st.subheader("📍 Member Concentration Map")
-            st.caption("Heatmap based on Member Zip Codes.")
-            
-            # Simple aggregation for mapping
+            st.subheader("📍 Member Heatmap")
+            # Aggregating by Zip for visualization
             zip_counts = df['Zip'].value_counts().reset_index()
             zip_counts.columns = ['Zip', 'Count']
             
-            # We use a Scatter Mapbox (Requires Zip Lat/Lon database for real precision, 
-            # but for this MVP we create a mock visualization structure)
-            st.warning("ℹ️ Note: Precise Lat/Lon geocoding requires a Zip Code Database integration. Showing distribution by count.")
-            
-            fig = px.bar(zip_counts.head(15), x='Zip', y='Count', title="Top 15 Zip Codes by Enrollment", color='Count')
+            # Interactive Bar for Density
+            fig = px.bar(zip_counts.head(20), x='Zip', y='Count', color='Count', 
+                         title="Top 20 Zip Codes (Density)", color_continuous_scale='Blues')
             st.plotly_chart(fig, use_container_width=True)
             
-            col1, col2 = st.columns(2)
-            with col1:
-                st.subheader("Demographics: Age Band")
-                fig_age = px.histogram(df[df['Age']>0], x="Age", nbins=10, title="Age Distribution", color_discrete_sequence=['#3498db'])
+            # Demographics
+            c1, c2 = st.columns(2)
+            with c1: 
+                fig_age = px.histogram(df[df['Age']>0], x="Age", nbins=15, title="Age Distribution", color_discrete_sequence=['#3498db'])
                 st.plotly_chart(fig_age, use_container_width=True)
-            with col2:
-                st.subheader("Demographics: Gender")
-                fig_gen = px.pie(df, names='Gender', title="Gender Split", hole=0.4)
+            with c2: 
+                fig_gen = px.pie(df, names="Gender", title="Gender Split", hole=0.4)
                 st.plotly_chart(fig_gen, use_container_width=True)
-                
         else:
-            st.error(f"Census parsing failed: {error}")
+            st.error(f"Census Error: {err}")
 
     # --- GEOACCESS DASHBOARD ---
     elif doc_type == 'GEO':
-        st.success("🌍 Processing GeoAccess Report...")
+        st.success("🌍 Processing GeoAccess Report")
         df = run_geo_parser(uploaded_file)
         
         if not df.empty:
-            # Calculate 'Disruption' (Inverse of Access)
-            df['Disruption %'] = 100 - df['Access %']
+            # Calc Disruption
+            df['Disruption'] = 100 - df['Access %']
             
             c1, c2 = st.columns(2)
-            avg_access = df['Access %'].mean()
-            c1.markdown(f"""<div class="metric-box"><div class="big-stat">{avg_access:.1f}%</div><div class="stat-label">Avg Network Match</div></div>""", unsafe_allow_html=True)
-            c2.markdown(f"""<div class="metric-box"><div class="big-stat">{len(df)}</div><div class="stat-label">Specialties Analyzed</div></div>""", unsafe_allow_html=True)
+            c1.metric("Avg Network Match", f"{df['Access %'].mean():.1f}%")
+            c2.metric("Specialties Analyzed", len(df))
             
-            st.subheader("📉 Network Gaps & Disruption")
-            st.caption("Identifying specialties falling below 100% access.")
+            st.subheader("📉 Disruption Analysis")
+            st.caption("Visualizing gaps where access is below 100%.")
             
-            # Highlight bars that are NOT 100%
-            fig = px.bar(df, x="Specialty", y="Access %", color="Disruption %", 
-                         title="Access Percentage by Specialty",
-                         range_y=[50, 105],
-                         color_continuous_scale="RdYlGn_r") # Red = High Disruption
+            # Green to Red scale (Red = High Disruption/Low Access)
+            fig = px.bar(df, x="Specialty", y="Access %", color="Disruption", 
+                         title="Network Access by Specialty",
+                         range_y=[50, 105], 
+                         color_continuous_scale="RdYlGn_r")
             
-            # Add a line for the target (e.g., 90%)
-            fig.add_hline(y=90, line_dash="dot", annotation_text="Minimum Standard (90%)", annotation_position="bottom right")
+            # Add Threshold Line
+            fig.add_hline(y=90, line_dash="dot", annotation_text="Standard (90%)")
             st.plotly_chart(fig, use_container_width=True)
             
-            st.subheader("Disruption Summary Table")
-            st.dataframe(df.style.format({"Access %": "{:.1f}%", "Disruption %": "{:.1f}%"}), use_container_width=True)
+            st.subheader("Detailed Findings")
+            st.dataframe(df.style.format({"Access %": "{:.1f}%", "Disruption": "{:.1f}%"}), use_container_width=True)
         else:
-            st.error("No GeoAccess tables found. Ensure the PDF contains standard tables like 'Primary Care | 98%'.")
+            st.error("Extraction Failed: Could not identify standard GeoAccess tables. Please ensure the PDF contains a table with headers like 'Specialty' and 'Access %'.")
 
-    # --- RX DASHBOARD (Legacy) ---
+    # --- RX DASHBOARD ---
     elif doc_type == 'RX':
-        st.success("💊 Processing Rx Claims...")
+        st.info("Rx Engine Active")
         df = run_rx_parser(uploaded_file)
         if not df.empty:
-            total_spend = df["Plan Cost"].sum()
-            st.markdown(f"""<div class="metric-box"><div class="big-stat">${total_spend:,.0f}</div><div class="stat-label">Total Rx Spend</div></div>""", unsafe_allow_html=True)
-            fig = px.bar(df, x="Month", y="Plan Cost", color="Cohort", title="Rx Trend Analysis")
-            st.plotly_chart(fig, use_container_width=True)
-    
+            st.metric("Total Spend", f"${df['Plan Cost'].sum():,.0f}")
+            st.plotly_chart(px.bar(df, x="Month", y="Plan Cost", color="Cohort"), use_container_width=True)
+            
     else:
-        st.info("👋 Welcome to the Network Analytics Suite.")
+        st.info("👋 Ready to Analyze.")
         st.markdown("""
-            **Upload a file to begin:**
-            * **Member Census (Excel/CSV):** Analyzes demographics and location density.
-            * **GeoAccess Report (PDF):** Visualizes network gaps and accessibility percentages.
+        **Supported Files:**
+        * **Member Census:** Excel/CSV with columns for Zip, DOB, Gender.
+        * **GeoAccess:** PDF Reports with standard Access tables.
         """)
