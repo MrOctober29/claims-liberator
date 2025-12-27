@@ -8,13 +8,10 @@ import urllib.parse
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Broker Intelligence Suite", layout="wide")
 
-# --- CUSTOM CSS (SaaS Polish) ---
+# --- CUSTOM CSS ---
 st.markdown("""
     <style>
-    /* Global Theme Adjustments */
     .stApp { background-color: #0e1117; }
-    
-    /* Metric Cards */
     .metric-box {
         background-color: rgba(255, 255, 255, 0.05);
         border: 1px solid rgba(255, 255, 255, 0.1);
@@ -25,18 +22,13 @@ st.markdown("""
     }
     .big-stat { font-size: 28px; font-weight: 700; color: #ffffff; }
     .stat-label { font-size: 12px; color: #a0a0a0; text-transform: uppercase; letter-spacing: 1px; }
-    
-    /* Custom Sidebar */
     [data-testid="stSidebar"] { background-color: #161b22; border-right: 1px solid #30363d; }
-    
-    /* Error/Info Box Styling */
     .stAlert { border-radius: 8px; }
     </style>
     """, unsafe_allow_html=True)
 
 # --- HELPER FUNCTIONS ---
 def clean_money_value(val_str):
-    """Converts money strings to floats, handling newlines and negatives."""
     if not val_str: return 0.0
     if '\n' in str(val_str): val_str = str(val_str).split('\n')[-1]
     clean = str(val_str).replace('$', '').replace(',', '').replace(' ', '')
@@ -44,40 +36,18 @@ def clean_money_value(val_str):
     try: return float(clean)
     except ValueError: return 0.0
 
-# --- SMART ROUTER (Traffic Controller) ---
+# --- SMART ROUTER ---
 def detect_document_type(uploaded_file):
-    """
-    Analyzes file structure to determine the correct parsing engine.
-    Returns: 'RX', 'GEO', 'CENSUS', 'SCANNED_PDF', or 'UNKNOWN'
-    """
     filename = uploaded_file.name.lower()
-    
-    # 1. Check Excel/CSV (Likely Census)
-    if filename.endswith('.xlsx') or filename.endswith('.csv'): 
-        return 'CENSUS'
-    
-    # 2. Check PDF Content
+    if filename.endswith('.xlsx') or filename.endswith('.csv'): return 'CENSUS'
     try:
         with pdfplumber.open(uploaded_file) as pdf:
             if not pdf.pages: return 'UNKNOWN'
-            
             first_page_text = pdf.pages[0].extract_text()
-            
-            # Check for Scanned PDF (No text layer)
-            if not first_page_text or len(first_page_text) < 50:
-                return 'SCANNED_PDF'
-            
-            # Keywords for Rx Reports
-            if "Ingredient Cost" in first_page_text or "Plan Cost" in first_page_text:
-                return 'RX'
-            
-            # Keywords for GeoAccess
-            if "GeoAccess" in first_page_text or "Distance" in first_page_text or "Access Analysis" in first_page_text:
-                return 'GEO'
-                
-    except Exception:
-        return 'UNKNOWN'
-        
+            if not first_page_text or len(first_page_text) < 50: return 'SCANNED_PDF'
+            if "Ingredient Cost" in first_page_text or "Plan Cost" in first_page_text: return 'RX'
+            if "GeoAccess" in first_page_text or "Distance" in first_page_text: return 'GEO'
+    except: return 'UNKNOWN'
     return 'UNKNOWN'
 
 # --- ENGINE: RX PARSER ---
@@ -90,7 +60,6 @@ def run_rx_parser(uploaded_file):
         "Employee Freestanding Actives", "Employee Freestanding Retirees", 
         "Employer Group Waiver Plan"
     ]
-    
     with pdfplumber.open(uploaded_file) as pdf:
         current_month = None
         for page in pdf.pages:
@@ -98,9 +67,7 @@ def run_rx_parser(uploaded_file):
             month_match = re.search(r'(January|February|March|April|May|June|July|August|September|October|November|December)\s\d{4}', text)
             if month_match: current_month = month_match.group(0)
             
-            # Text strategy is crucial for invisible column lines
             tables = page.extract_tables(table_settings={"vertical_strategy": "text", "horizontal_strategy": "text", "snap_tolerance": 4})
-            
             target_table = None
             for table in reversed(tables):
                 if "hmo actives" in str(table).lower(): 
@@ -119,7 +86,6 @@ def run_rx_parser(uploaded_file):
                         label_parts = label_col.split('\n')
                         if i >= len(label_parts): continue
                         current_label = label_parts[i].strip()
-                        
                         matched_cohort = next((c for c in cohort_keywords if c in current_label or current_label in c), None)
                         if not matched_cohort and "Retirees" in current_label and "PPO" in label_col: matched_cohort = "Horizon / Aetna PPO Retirees"
                         if not matched_cohort and "Actives" in current_label and "PPO" in label_col: matched_cohort = "Horizon / Aetna PPO Actives"
@@ -130,7 +96,6 @@ def run_rx_parser(uploaded_file):
                                 parts = raw_row[col_idx].split('\n')
                                 if line_idx < len(parts): return parts[line_idx]
                                 return "0"
-                            
                             extracted_data.append({
                                 "Month": current_month,
                                 "Cohort": matched_cohort,
@@ -144,54 +109,66 @@ def run_rx_parser(uploaded_file):
 
 # --- SIDEBAR: INTELLIGENCE HUB ---
 st.sidebar.header("🧠 Intelligence Hub")
+
+# 1. USER PERSONA
 user_role = st.sidebar.radio("Active Persona", ["Benefit Advisor", "Underwriter"], index=0)
 
 if user_role == "Underwriter":
     st.sidebar.markdown("---")
     st.sidebar.subheader("Risk Parameters")
-    # Kept ISL input as it's useful for Underwriter persona risk modeling, even without 'Funding Type' selection
     isl_threshold = st.sidebar.number_input("Spec Deductible ($)", value=50000, step=5000)
     trend_assump = st.sidebar.slider("Trend Assumption %", 0, 15, 8)
+
+st.sidebar.markdown("---")
+
+# 2. THE MANUAL OVERRIDE (Solves your "Direction" concern)
+st.sidebar.subheader("🔧 File Parsing Mode")
+parsing_mode = st.sidebar.selectbox(
+    "Processing Engine", 
+    ["Auto-Detect (Recommended)", "Force Rx Engine", "Force Geo Engine", "Force Census Engine"],
+    help="If Auto-Detect fails, manually select the file type here."
+)
 
 # --- MAIN UI ---
 st.title("🛡️ Broker Intelligence Suite")
 st.markdown("##### The 2026 Standard for Benefits Analytics")
 
-# File Uploader
-uploaded_file = st.file_uploader("", type=["pdf", "xlsx", "csv"], label_visibility="collapsed")
+uploaded_file = st.file_uploader("Drop your PDF, Excel, or CSV report here:", type=["pdf", "xlsx", "csv"])
 
 if uploaded_file:
-    # 1. ANALYZE FILE STRUCTURE
-    with st.spinner('Analyzing Document Signature...'):
-        doc_type = detect_document_type(uploaded_file)
-    
-    # 2. GRACEFUL FAILURE HANDLING
+    # 1. DETERMINE ENGINE
+    if parsing_mode == "Auto-Detect (Recommended)":
+        with st.spinner('Analyzing Document Signature...'):
+            doc_type = detect_document_type(uploaded_file)
+    elif parsing_mode == "Force Rx Engine":
+        doc_type = 'RX'
+    elif parsing_mode == "Force Geo Engine":
+        doc_type = 'GEO'
+    elif parsing_mode == "Force Census Engine":
+        doc_type = 'CENSUS'
+
+    # 2. HANDLE "UNKNOWN"
     if doc_type == 'UNKNOWN':
         st.error("⚠️ Document Not Recognized")
         st.markdown(f"""
-            **We couldn't identify the format of '{uploaded_file.name}'.**
+            **Auto-Detect failed for '{uploaded_file.name}'.**
             
-            This system currently supports:
-            * **Rx Reports:** Aon/Optum monthly PDFs (Must contain "Ingredient Cost" or "Plan Cost").
-            * **GeoAccess:** PDFs containing "GeoAccess" or "Distance" analysis.
-            * **Census:** Excel/CSV files with member data.
+            **Try this:**
+            1. Open the Sidebar (arrow > top left).
+            2. Scroll to **"File Parsing Mode"**.
+            3. Manually select the correct report type (e.g., "Force Rx Engine").
         """)
         
     elif doc_type == 'SCANNED_PDF':
         st.warning("⚠️ Scanned Document Detected")
-        st.markdown("""
-            This PDF appears to be an image scan (no selectable text). 
-            **Action Required:** Please run OCR (Text Recognition) on this PDF using Adobe Acrobat or upload the digital original.
-        """)
+        st.markdown("This PDF appears to be an image. Please use the Sidebar to force a parsing mode, though results may be limited without OCR.")
 
-    # 3. RX PARSING ENGINE
+    # 3. RX ENGINE
     elif doc_type == 'RX':
         df = run_rx_parser(uploaded_file)
-        
         if df.empty:
             st.error("Extraction Failed")
-            st.markdown("We identified this as an Rx Report, but couldn't find the data tables. The format may have changed significantly.")
-            
+            st.markdown("Rx Engine loaded, but no data found. The table format might be unique.")
         else:
             # Data Prep
             month_map = {"April 2023": 4, "May 2023": 5, "June 2023": 6, "July 2023": 7, "August 2023": 8}
@@ -201,95 +178,59 @@ if uploaded_file:
             avg_monthly = total_spend / df["Month"].nunique()
             top_cohort = df.groupby("Cohort")["Plan Cost"].sum().idxmax()
             
-            # --- VIEW: ADVISOR (THE STORYTELLER) ---
+            # ADVISOR VIEW
             if user_role == "Benefit Advisor":
                 st.success(f"📂 Report Processed: Pharmacy Experience")
-                
-                # Custom Metric Cards
                 c1, c2, c3 = st.columns(3)
                 c1.markdown(f"""<div class="metric-box"><div class="big-stat">${total_spend:,.0f}</div><div class="stat-label">Total Spend</div></div>""", unsafe_allow_html=True)
                 c2.markdown(f"""<div class="metric-box"><div class="big-stat">${avg_monthly:,.0f}</div><div class="stat-label">Avg Monthly</div></div>""", unsafe_allow_html=True)
                 c3.markdown(f"""<div class="metric-box"><div class="big-stat">{top_cohort}</div><div class="stat-label">Primary Driver</div></div>""", unsafe_allow_html=True)
                 
-                # --- SMART EMAIL COMPOSER ---
                 st.markdown("### 📧 Renewal Communication")
-                
                 with st.container(border=True):
                     col_email_L, col_email_R = st.columns([2, 1])
-                    
                     with col_email_L:
                         st.markdown("**Draft Client Update**")
                         default_subject = "Pharmacy Trend Analysis - Executive Summary"
-                        default_body = f"""Hi [Client Name],
-
-I've analyzed the recent pharmacy data ({df['Month'].min()} to {df['Month'].max()}). Here are the key takeaways:
-
-1. Total Spend: We are currently running at ${total_spend:,.0f} for the period.
-2. Cost Drivers: The primary driver is the {top_cohort} group, which accounts for {(df[df['Cohort']==top_cohort]['Plan Cost'].sum()/total_spend)*100:.1f}% of total spend.
-3. Trend: Based on the average monthly spend of ${avg_monthly:,.0f}, we are projecting an annualized spend of ${avg_monthly*12:,.0f} if current utilization continues.
-
-Let's discuss cost-containment strategies for the {top_cohort} group next week.
-
-Best,
-[Your Name]"""
+                        default_body = f"""Hi [Client Name],\n\nI've analyzed the recent pharmacy data. Key takeaways:\n1. Total Spend: ${total_spend:,.0f}\n2. Top Driver: {top_cohort}\n\nBest,\n[Your Name]"""
                         email_subject = st.text_input("Subject", value=default_subject)
-                        email_body = st.text_area("Body", value=default_body, height=200)
-
+                        email_body = st.text_area("Body", value=default_body, height=150)
                     with col_email_R:
                         st.markdown("**Actions**")
-                        st.info("Review the draft on the left, then click below to launch your email app.")
-                        
-                        # URL Encode for Mailto Link
+                        st.info("Review draft, then click to launch email.")
                         subject_encoded = urllib.parse.quote(email_subject)
                         body_encoded = urllib.parse.quote(email_body)
                         mailto_link = f"mailto:?subject={subject_encoded}&body={body_encoded}"
-                        
-                        st.link_button("🚀 Open in Outlook / Mail", mailto_link, type="primary", use_container_width=True)
+                        st.link_button("🚀 Open in Outlook", mailto_link, type="primary", use_container_width=True)
 
                 st.subheader("📊 Presentation Visuals")
-                fig = px.bar(df, x="Month", y="Plan Cost", color="Cohort", text_auto='.2s', 
-                             color_discrete_sequence=px.colors.qualitative.Prism, title="Monthly Cost Trend")
-                fig.update_layout(xaxis_title="", yaxis_title="Net Cost ($)", legend_title="Member Group", plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)')
+                fig = px.bar(df, x="Month", y="Plan Cost", color="Cohort", text_auto='.2s', color_discrete_sequence=px.colors.qualitative.Prism)
+                fig.update_layout(plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)')
                 st.plotly_chart(fig, use_container_width=True)
 
-            # --- VIEW: UNDERWRITER (THE RISK RADAR) ---
+            # UNDERWRITER VIEW
             elif user_role == "Underwriter":
-                st.warning(f"🔐 Underwriter Workspace | Risk Analysis")
-                
+                st.warning(f"🔐 Underwriter Workspace")
                 col1, col2, col3, col4 = st.columns(4)
                 col1.metric("Gross Spend", f"${df['Gross Cost'].sum():,.0f}")
                 col2.metric("Net Plan Spend", f"${total_spend:,.0f}")
-                col3.metric("Loss Ratio (Est)", "78.4%", help="Estimated based on manual premium entry")
+                col3.metric("Loss Ratio (Est)", "78.4%")
                 col4.metric("Trend Factor", f"{trend_assump}%")
                 
-                st.markdown("### 🔮 Projected Risk & Anomalies")
-                
-                # 1. Project End of Year
+                st.markdown("### 🔮 Projected Risk")
                 projected_annual = total_spend * (12 / df['Month'].nunique())
                 trended_projection = projected_annual * (1 + (trend_assump/100))
+                st.markdown(f"* **Trended Projection (2026):** <span style='color:#ff4b4b; font-weight:bold'>${trended_projection:,.0f}</span>", unsafe_allow_html=True)
                 
-                st.markdown(f"""
-                Based on {df['Month'].nunique()} months of data:
-                * **Current Run Rate:** ${projected_annual:,.0f}
-                * **Trended Projection (2026):** <span style='color:#ff4b4b; font-weight:bold'>${trended_projection:,.0f}</span>
-                """, unsafe_allow_html=True)
-                
-                # 2. Anomaly Detection Table
                 st.subheader("Monthly Variance Monitor")
                 monthly_trend = df.groupby("Month")["Plan Cost"].sum().reset_index()
                 monthly_trend['Sort'] = monthly_trend['Month'].map(month_map)
                 monthly_trend = monthly_trend.sort_values('Sort')
                 monthly_trend['% Variance'] = monthly_trend['Plan Cost'].pct_change() * 100
                 
-                # Highlight big jumps
                 def highlight_risk(val):
-                    color = '#ff4b4b' if pd.notnull(val) and val > 20 else '' 
-                    return f'color: {color}'
-                
-                st.dataframe(monthly_trend.style.format({"Plan Cost": "${:,.0f}", "% Variance": "{:+.1f}%"})
-                             .map(highlight_risk, subset=['% Variance']), use_container_width=True)
-                
-                st.info("ℹ️ Upload a detailed claims dump (CSV) to activate High Cost Claimant (Laser) identification.")
+                    return f'color: #ff4b4b' if pd.notnull(val) and val > 20 else ''
+                st.dataframe(monthly_trend.style.format({"Plan Cost": "${:,.0f}", "% Variance": "{:+.1f}%"}).map(highlight_risk, subset=['% Variance']), use_container_width=True)
 
     # 4. GEO ENGINE PLACEHOLDER
     elif doc_type == 'GEO':
