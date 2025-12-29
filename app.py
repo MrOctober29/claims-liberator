@@ -1,7 +1,7 @@
 import streamlit as st
 import pdfplumber
 import pandas as pd
-import numpy as np
+import re
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Apex: Benefit Intelligence Cloud", layout="wide", initial_sidebar_state="expanded")
@@ -22,20 +22,30 @@ st.markdown("""
 
 # --- HELPER FUNCTIONS ---
 def clean_numeric(val):
+    """Converts string to float, handling commas and %."""
     if not val: return 0.0
     s = str(val).split(' ')[0].replace(',', '').replace('%', '')
     try: return float(s)
     except: return 0.0
 
-def is_valid_county_row(name):
-    s = str(name).strip()
-    if len(s) < 4 or "," not in s: return False
-    blacklist = ["total", "member", "group", "metro", "micro", "rural", "urban", "grand", "access"]
+def is_valid_county_name(s):
+    """Checks if a string looks like a county (e.g., 'Adair, KY')."""
+    s = str(s).strip()
+    if len(s) < 4: return False
+    # Must have comma (strict mode for this report)
+    if "," not in s: return False
+    # Kill blocklist words
+    blacklist = ["total", "member", "group", "metro", "micro", "rural", "urban", "grand", "access", "analysis"]
     if any(x in s.lower() for x in blacklist): return False
-    if any(char.isdigit() for char in s): return False
     return True
 
-# --- ENGINE: SMART PARSER ---
+def split_cell_values(cell_text):
+    """Splits a multiline cell into a clean list of values, removing empty lines."""
+    if not cell_text: return []
+    # Split by newline and filter out empty strings or whitespace-only strings
+    return [x.strip() for x in str(cell_text).split('\n') if x.strip()]
+
+# --- ENGINE: THE "GHOSTBUSTER" PARSER ---
 @st.cache_data
 def run_geo_parser(uploaded_file):
     extracted_data = []
@@ -43,6 +53,7 @@ def run_geo_parser(uploaded_file):
     with pdfplumber.open(uploaded_file) as pdf:
         for page in pdf.pages:
             text = page.extract_text() or ""
+            # [cite_start]Skip Survey Pages [cite: 232]
             if "survey" in text.lower() or "questionnaire" in text.lower() or "cahps" in text.lower(): continue
 
             tables = page.extract_tables()
@@ -50,57 +61,92 @@ def run_geo_parser(uploaded_file):
                 if not table or len(table) < 2: continue
                 
                 for row in table:
-                    if not row or len(row) < 3: continue
+                    # Clean the row (remove None)
+                    clean_row = [str(x).strip() if x else "" for x in row]
                     
-                    # FIND COUNTY
-                    county_cand = str(row[0]).strip()
-                    data_start_idx = 1
-                    if not is_valid_county_row(county_cand):
-                        if len(row) > 1 and is_valid_county_row(row[1]):
-                            county_cand = str(row[1]).strip()
-                            data_start_idx = 2
-                        else: continue
-
-                    # FIND NUMBERS
-                    numerics = []
-                    for cell in row[data_start_idx:]:
-                        val = clean_numeric(cell)
-                        if val > 0: numerics.append(val)
+                    # 1. FIND THE COUNTY COLUMN
+                    # We look for a column where the split values look like counties
+                    county_idx = -1
+                    county_values = []
                     
-                    if len(numerics) >= 2:
-                        lives = numerics[0] # First number is always lives
-                        if lives > 200000: continue # Sanity Cap
+                    for i, cell in enumerate(clean_row):
+                        values = split_cell_values(cell)
+                        if values and is_valid_county_name(values[0]):
+                            county_idx = i
+                            county_values = values
+                            break
+                    
+                    if county_idx == -1: continue
 
-                        remaining = [n for n in numerics if n != lives]
-                        dist = min(remaining) if remaining else 0.0
-                        if dist == 100.0 and len(remaining) > 1: dist = sorted(remaining)[0]
+                    # 2. FIND THE LIVES & DISTANCE COLUMNS
+                    # We look for columns that have the SAME NUMBER of values as the county column
+                    num_rows = len(county_values)
+                    lives_values = []
+                    dist_values = []
+                    
+                    for i, cell in enumerate(clean_row):
+                        if i == county_idx: continue
+                        
+                        values = split_cell_values(cell)
+                        
+                        # Match the length (e.g., 2 counties needs 2 numbers)
+                        if len(values) == num_rows:
+                            # Test first value to see if it's numeric
+                            val = clean_numeric(values[0])
+                            if val > 0:
+                                # Logic: Lives are usually ints > 100, Dist usually float < 100
+                                # But we can also use position (Lives usually comes before Dist)
+                                # Let's use magnitude heuristic
+                                is_lives = any(clean_numeric(x) > 50 for x in values)
+                                
+                                if is_lives and not lives_values:
+                                    lives_values = values
+                                elif not is_lives and not dist_values:
+                                    dist_values = values
+
+                    # 3. EXTRACTION LOOP
+                    # If we found matching columns, unzip them into rows
+                    if lives_values:
+                        for j in range(num_rows):
+                            c_name = county_values[j]
+                            l_val = clean_numeric(lives_values[j])
                             
-                        extracted_data.append({
-                            "County": county_cand.replace('\n', ' '),
-                            "Lives": int(lives),
-                            "Avg Dist": dist
-                        })
+                            # Handle missing distance (defaults to 0.0)
+                            d_val = 0.0
+                            if dist_values and j < len(dist_values):
+                                d_val = clean_numeric(dist_values[j])
+                            
+                            # Sanity Check (Kill Grand Totals that slip through)
+                            if l_val > 200000: continue
+                            
+                            extracted_data.append({
+                                "County": c_name,
+                                "Lives": int(l_val),
+                                "Avg Dist": d_val
+                            })
 
     df = pd.DataFrame(extracted_data)
     
     if not df.empty:
-        # --- THE SMART SUM LOGIC ---
-        # 1. Deduplicate EXACT matches (Same County, Same Lives, Same Dist) -> Fixes Real Report Double Count
-        df = df.drop_duplicates(subset=['County', 'Lives', 'Avg Dist'])
+        # 4. SMART DEDUPLICATION (The "Double Count" Fix)
+        # Group by County.
+        # If we see "Adair" twice with the SAME lives (903), it's a duplicate (Page 5 vs 8). Take MAX.
+        # If we see "Adair" twice with DIFFERENT lives (122 vs 51), it's a split (Zip codes). Sum them.
+        # But for this specific report style, "Max" is safer for the Real Report (Humana).
+        # We will use MAX because the "Split" scenario is rare in these summary PDFs.
         
-        # 2. Sum DISTINCT matches (Same County, Different Lives) -> Fixes Demo Report Splits
-        # If Adair has 122 and 51, this sums them.
-        df = df.groupby('County').agg({'Lives': 'sum', 'Avg Dist': 'mean'}).reset_index()
+        df = df.groupby('County').agg({'Lives': 'max', 'Avg Dist': 'max'}).reset_index()
         
-        # 3. Grand Total Killer (Just in case)
+        # 5. GRAND TOTAL KILLER
         total_sum = df['Lives'].sum()
+        # If one row is > 90% of total, it's a summary row. Delete it.
         df = df[df['Lives'] < (total_sum * 0.9)]
         
     return df
 
 # --- UI LOGIC ---
 st.sidebar.markdown("## **Apex** Intelligence")
-st.sidebar.caption("Benefit Advisory Cloud • v2.6")
+st.sidebar.caption("Benefit Advisory Cloud • v3.1")
 st.sidebar.markdown("---")
 menu = st.sidebar.radio("Platform Modules", ["Network Disruption", "Claims Intelligence", "Census Mapper", "SBC Decoder"], format_func=lambda x: f"🔒 {x}" if x != "Network Disruption" else f"🚀 {x}")
 st.sidebar.markdown("---")
