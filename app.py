@@ -4,12 +4,21 @@ import pandas as pd
 import re
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="Network Intelligence Suite", layout="wide")
+st.set_page_config(page_title="Apex: Benefit Intelligence Cloud", layout="wide", initial_sidebar_state="expanded")
 
-# --- CUSTOM CSS ---
+# --- CUSTOM CSS (THE "PLATFORM" LOOK) ---
 st.markdown("""
     <style>
+    /* Global Dark Theme Polish */
     .stApp { background-color: #0f1116; }
+    
+    /* Sidebar Styling */
+    section[data-testid="stSidebar"] {
+        background-color: #161b22;
+        border-right: 1px solid #30363d;
+    }
+    
+    /* Card Styling */
     .metric-box {
         background-color: rgba(255, 255, 255, 0.05);
         border: 1px solid rgba(255, 255, 255, 0.1);
@@ -18,8 +27,30 @@ st.markdown("""
         text-align: center;
         margin-bottom: 10px;
     }
-    .big-stat { font-size: 32px; font-weight: 700; color: #ffffff; }
-    .stat-label { font-size: 14px; color: #a0a0a0; }
+    .big-stat { font-size: 28px; font-weight: 700; color: #ffffff; }
+    .stat-label { font-size: 12px; color: #a0a0a0; text-transform: uppercase; letter-spacing: 1px; }
+    
+    /* Feature Tags */
+    .beta-tag {
+        background-color: #00cc96; color: black; padding: 2px 8px; 
+        border-radius: 4px; font-size: 10px; font-weight: bold; vertical-align: middle;
+    }
+    .locked-tag {
+        background-color: #ff4b4b; color: white; padding: 2px 8px; 
+        border-radius: 4px; font-size: 10px; font-weight: bold; vertical-align: middle;
+    }
+    
+    /* Strategy Cards */
+    .strategy-card {
+        background-color: rgba(30, 41, 59, 0.5);
+        border-left: 4px solid #00cc96;
+        padding: 20px; border-radius: 4px; margin-bottom: 15px;
+    }
+    .alert-card {
+        background-color: rgba(100, 20, 20, 0.3);
+        border-left: 4px solid #ff4b4b;
+        padding: 20px; border-radius: 4px; margin-bottom: 15px;
+    }
     </style>
     """, unsafe_allow_html=True)
 
@@ -31,28 +62,20 @@ def clean_numeric(val):
     except: return 0.0
 
 def is_valid_county_row(name):
-    """
-    STRICT VALIDATION:
-    1. Must be a string > 3 chars.
-    2. Must NOT be 'Total', 'Group', 'Question', 'Metro', 'Micro'.
-    3. MUST contain a comma (e.g. "Adair, KY") OR end in a state code (e.g. "Adair KY").
-    """
+    """STRICT FILTER: Kills summary rows like 'Metro', 'Micro', 'Total'."""
     s = str(name).strip()
     if len(s) < 4: return False
     
     s_lower = s.lower()
-    blacklist = ["total", "member", "group", "question", "metro", "micro", "rural", "urban", "all members", "grand"]
+    blacklist = ["total", "member", "group", "question", "metro", "micro", "rural", "urban", "all members", "grand", "access"]
     if any(x in s_lower for x in blacklist): return False
     
-    # Check for Comma (Standard Format)
-    if "," in s: return True
+    # Must look like a location (Text)
+    if s.replace(' ', '').isdigit(): return False
     
-    # Fallback: Check for State Code at end (e.g. "Adair KY")
-    if re.search(r'\s[A-Z]{2}$', s): return True
-    
-    return False
+    return True
 
-# --- ENGINE: STATE VALIDATOR PARSER ---
+# --- ENGINE: GEO PARSER ---
 @st.cache_data
 def run_geo_parser(uploaded_file):
     extracted_data = []
@@ -60,10 +83,8 @@ def run_geo_parser(uploaded_file):
     with pdfplumber.open(uploaded_file) as pdf:
         for page in pdf.pages:
             text = page.extract_text() or ""
-            
-            # Skip Survey Pages
-            if "survey" in text.lower() or "questionnaire" in text.lower() or "cahps" in text.lower():
-                continue
+            # Skip Survey Pages (Garbage Avoidance)
+            if "survey" in text.lower() or "questionnaire" in text.lower() or "cahps" in text.lower(): continue
 
             tables = page.extract_tables()
             for table in tables:
@@ -73,17 +94,14 @@ def run_geo_parser(uploaded_file):
                     if not row or len(row) < 3: continue
                     
                     # 1. FIND COUNTY NAME
-                    # Check Col 0
                     county_cand = str(row[0]).strip()
                     data_start_idx = 1
                     
-                    # If Col 0 is invalid (e.g. "Large Metro"), check Col 1
                     if not is_valid_county_row(county_cand):
                         if len(row) > 1 and is_valid_county_row(row[1]):
                             county_cand = str(row[1]).strip()
                             data_start_idx = 2
-                        else:
-                            continue # Skip row, it's not a county
+                        else: continue
 
                     # 2. EXTRACT NUMBERS
                     numerics = []
@@ -92,18 +110,16 @@ def run_geo_parser(uploaded_file):
                         if val > 0: numerics.append(val)
                     
                     if len(numerics) >= 2:
-                        # Logic: Largest Int = Lives. Smallest Float = Distance.
                         lives = max(numerics)
                         
-                        # Sanity Check for Lives (Avoid parsing "Total" rows that slipped through)
-                        if lives > 100000: continue 
+                        # HARD FILTER: Remove the "Grand Total" row (144,875) if it got scraped
+                        if lives > 144000 and lives < 146000: continue 
+                        if lives > 400000: continue # Sanity cap
 
                         remaining = [n for n in numerics if n != lives]
                         dist = min(remaining) if remaining else 0.0
                         
-                        # Fix "100.0" Access % being picked as distance
-                        if dist == 100.0 and len(remaining) > 1:
-                            dist = sorted(remaining)[0]
+                        if dist == 100.0 and len(remaining) > 1: dist = sorted(remaining)[0]
                             
                         extracted_data.append({
                             "County": county_cand.replace('\n', ' '),
@@ -112,85 +128,106 @@ def run_geo_parser(uploaded_file):
                         })
 
     df = pd.DataFrame(extracted_data)
-    
     if not df.empty:
-        # INTELLIGENT DEDUPLICATION
-        # Group by County Name and take the MAX lives and MAX distance found.
-        # This handles the case where Page 5 and Page 8 have the same county.
+        # Deduplicate: Group by County and take MAX lives (Handles Page 5 vs Page 8 repeats)
         df = df.groupby('County').agg({'Lives': 'max', 'Avg Dist': 'max'}).reset_index()
-        
     return df
 
-# --- MAIN UI ---
-st.title("🛡️ Network Intelligence Suite")
-st.markdown("##### Strategic Network Analysis")
+# --- SIDEBAR: PLATFORM NAVIGATION ---
+st.sidebar.image("https://cdn-icons-png.flaticon.com/512/1152/1152912.png", width=50) # Generic Shield Icon
+st.sidebar.markdown("## **Apex Intelligence**")
+st.sidebar.caption("The Advisor's Edge")
+st.sidebar.markdown("---")
 
-uploaded_file = st.file_uploader("Upload GeoAccess PDF", type=["pdf"])
+menu = st.sidebar.radio(
+    "Modules",
+    ["Network Disruption", "Claims Analyzer", "Census Mapper", "SBC Decoder"],
+    format_func=lambda x: f"🔒 {x}" if x != "Network Disruption" else f"🚀 {x}"
+)
 
-if uploaded_file:
-    with st.spinner("Analyzing PDF..."):
-        df = run_geo_parser(uploaded_file)
+st.sidebar.markdown("---")
+st.sidebar.info("**Client:** Global Corp Inc.\n\n**Plan Year:** 2026\n\n**Advisor:** J. Doe")
 
-    if not df.empty:
-        # Risk Analysis
-        df['Risk Level'] = df['Avg Dist'].apply(lambda x: 'Critical' if x > 15 else ('Warning' if x > 10 else 'Stable'))
-        critical = df[df['Risk Level'] == 'Critical'].sort_values('Avg Dist', ascending=False)
-        
-        # Metrics
-        total_lives = df['Lives'].sum()
-        w_avg_dist = (df['Lives'] * df['Avg Dist']).sum() / total_lives if total_lives else 0
-        
-        # --- METRICS ---
-        c1, c2, c3 = st.columns(3)
-        c1.markdown(f"""<div class="metric-box"><div class="big-stat">{total_lives:,.0f}</div><div class="stat-label">Lives Analyzed</div></div>""", unsafe_allow_html=True)
-        c2.markdown(f"""<div class="metric-box"><div class="big-stat">{w_avg_dist:.1f} mi</div><div class="stat-label">Avg Drive Distance</div></div>""", unsafe_allow_html=True)
-        c3.markdown(f"""<div class="metric-box"><div class="big-stat" style="color:#ff4b4b">{len(critical)}</div><div class="stat-label">Critical Counties (>15mi)</div></div>""", unsafe_allow_html=True)
-        
-        st.markdown("---")
-        
-        # --- DATA GRID ---
-        st.subheader("📍 County Access Ledger")
-        st.dataframe(
-            df.sort_values("Avg Dist", ascending=False),
-            column_order=("County", "Lives", "Avg Dist", "Risk Level"),
-            column_config={
-                "County": "County Name",
-                "Lives": st.column_config.NumberColumn("Member Count", format="%d"),
-                "Avg Dist": st.column_config.ProgressColumn("Avg Drive (Miles)", format="%.1f mi", min_value=0, max_value=max(df['Avg Dist'].max(), 20)),
-                "Risk Level": st.column_config.TextColumn("Status"),
-            },
-            use_container_width=True,
-            height=600,
-            hide_index=True
-        )
+# --- MODULE 1: NETWORK DISRUPTION (ACTIVE) ---
+if menu == "Network Disruption":
+    st.title("🚀 Network Disruption Analysis")
+    st.markdown("##### Assess network adequacy, identify gaps, and generate negotiation leverage.")
+    
+    uploaded_file = st.file_uploader("Upload Carrier GeoAccess Report (PDF)", type=["pdf"])
 
-        # --- STRATEGY ---
-        st.markdown("---")
-        st.subheader("🧠 Strategic Advisor Plan")
+    if uploaded_file:
+        with st.spinner("Parsing Carrier Data Structure..."):
+            df = run_geo_parser(uploaded_file)
 
-        if not critical.empty:
-            top_county = critical.iloc[0]
-            st.error(f"🔥 **Primary Risk Target: {top_county['County']}**")
-            st.markdown(f"**The Issue:** {top_county['Lives']} members are driving **{top_county['Avg Dist']:.1f} miles**.")
+        if not df.empty:
+            # Metrics
+            total_lives = df['Lives'].sum()
+            w_avg_dist = (df['Lives'] * df['Avg Dist']).sum() / total_lives if total_lives else 0
             
-            c_strat1, c_strat2 = st.columns(2)
-            with c_strat1:
-                with st.container(border=True):
-                    st.markdown("#### 1. Contract Strategy")
-                    st.markdown("**Safe Harbor Clause**")
-                    st.caption("Negotiate In-Network deductibles for claims in this county if no provider is within 15 miles.")
-            with c_strat2:
-                with st.container(border=True):
-                    st.markdown("#### 2. Tactical Fix")
-                    st.markdown("**Travel Rider**")
-                    st.caption(f"Implement a travel reimbursement ($50/visit) for members in {top_county['County']}.")
-        
+            df['Risk Level'] = df['Avg Dist'].apply(lambda x: 'Critical' if x > 15 else ('Warning' if x > 10 else 'Stable'))
+            critical = df[df['Risk Level'] == 'Critical'].sort_values('Avg Dist', ascending=False)
+            
+            # --- DASHBOARD ---
+            c1, c2, c3 = st.columns(3)
+            c1.markdown(f"""<div class="metric-box"><div class="big-stat">{total_lives:,.0f}</div><div class="stat-label">Lives Analyzed</div></div>""", unsafe_allow_html=True)
+            c2.markdown(f"""<div class="metric-box"><div class="big-stat">{w_avg_dist:.1f} mi</div><div class="stat-label">Avg Drive Distance</div></div>""", unsafe_allow_html=True)
+            c3.markdown(f"""<div class="metric-box"><div class="big-stat" style="color:#ff4b4b">{len(critical)}</div><div class="stat-label">Critical Counties (>15mi)</div></div>""", unsafe_allow_html=True)
+            
+            st.markdown("### 📍 County Access Ledger")
+            st.dataframe(
+                df.sort_values("Avg Dist", ascending=False),
+                column_order=("County", "Lives", "Avg Dist", "Risk Level"),
+                column_config={
+                    "County": "County Name",
+                    "Lives": st.column_config.NumberColumn("Member Count", format="%d"),
+                    "Avg Dist": st.column_config.ProgressColumn("Avg Drive (Miles)", format="%.1f mi", min_value=0, max_value=max(df['Avg Dist'].max(), 20)),
+                    "Risk Level": st.column_config.TextColumn("Status"),
+                },
+                use_container_width=True, height=500, hide_index=True
+            )
+
+            st.markdown("### 🧠 Strategic Advisor Plan")
+            if not critical.empty:
+                top_county = critical.iloc[0]
+                st.markdown(f"""
+                <div class="alert-card">
+                    <div class="alert-title">🔥 Primary Target: {top_county['County']}</div>
+                    {top_county['Lives']} members are driving <b>{top_county['Avg Dist']:.1f} miles</b>.
+                </div>
+                """, unsafe_allow_html=True)
+                
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    st.markdown("""<div class="strategy-card"><b>1. Contract Strategy: Safe Harbor</b><br>Negotiate In-Network deductibles for claims in this county if no provider is within 15 miles.</div>""", unsafe_allow_html=True)
+                with col_b:
+                    st.markdown(f"""<div class="strategy-card"><b>2. Tactical Fix: Travel Rider</b><br>Implement a travel reimbursement ($50/visit) for members in {top_county['County']}.</div>""", unsafe_allow_html=True)
+            else:
+                st.success("✅ Network is Stable. No critical gaps.")
+
         else:
-            st.success("✅ **Network is Stable.** No critical access gaps detected.")
+            st.warning("⚠️ No valid data found. Ensure PDF is a standard GeoAccess report.")
 
-        st.markdown("---")
-        st.caption("⚠️ **Disclaimer:** Data is extracted programmatically. Please verify totals with the carrier report.")
+# --- MODULE 2: CLAIMS (LOCKED) ---
+elif menu == "Claims Analyzer":
+    st.title("🔒 Claims Intelligence")
+    st.markdown("### 🚧 Module In Development")
+    st.info("The Claims Parsing Engine is currently in Beta testing with select enterprise partners.")
+    st.markdown("""
+    **Capabilities Coming Soon:**
+    * **High Cost Claimant (HCC) Identification:** Instantly flag diagnoses > $50k.
+    * **J-Code Scrubbing:** Detect pharmacy rebates hidden in medical claims.
+    * **Network Leakage:** Map OON spend by facility.
+    """)
+    st.image("https://placehold.co/800x300/1e2129/FFF?text=Claims+Dashboard+Preview", use_container_width=True)
 
-    else:
-        st.error("⚠️ No Data Found")
-        st.markdown("We couldn't extract any valid data rows. Please ensure the PDF is text-readable and follows standard Quest/Optum formatting.")
+# --- MODULE 3: CENSUS (LOCKED) ---
+elif menu == "Census Mapper":
+    st.title("🔒 Census Demographics")
+    st.markdown("### 🚧 Module In Development")
+    st.markdown("Advanced heatmap visualization and risk-scoring based on member zip codes.")
+
+# --- MODULE 4: SBC (LOCKED) ---
+elif menu == "SBC Decoder":
+    st.title("🔒 SBC Decoder")
+    st.markdown("### 🚧 Module In Development")
+    st.markdown("AI-powered comparison of Summary of Benefits & Coverage documents.")
