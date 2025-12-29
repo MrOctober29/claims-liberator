@@ -20,100 +20,105 @@ st.markdown("""
     }
     .big-stat { font-size: 32px; font-weight: 700; color: #ffffff; }
     .stat-label { font-size: 14px; color: #a0a0a0; }
-    
-    /* Strategy Cards */
-    .strategy-card {
-        background-color: rgba(30, 41, 59, 0.5);
-        border-left: 4px solid #00cc96;
-        padding: 20px;
-        border-radius: 4px;
-        margin-bottom: 15px;
-    }
-    .strategy-title { font-weight: bold; color: #00cc96; font-size: 16px; margin-bottom: 5px; }
-    .strategy-body { font-size: 14px; color: #e0e0e0; }
-    
-    /* Critical Alert */
-    .alert-card {
-        background-color: rgba(100, 20, 20, 0.3);
-        border-left: 4px solid #ff4b4b;
-        padding: 20px;
-        border-radius: 4px;
-        margin-bottom: 15px;
-    }
-    .alert-title { font-weight: bold; color: #ff4b4b; font-size: 16px; margin-bottom: 5px; }
-    
-    .disclaimer { font-size: 11px; color: #666; margin-top: 50px; text-align: center; }
     </style>
     """, unsafe_allow_html=True)
 
 # --- HELPER: CLEANING ---
 def clean_numeric(val):
     if not val: return 0.0
-    # Removes footnotes like '100.0 1' -> '100.0'
+    # Clean string: remove % , and footnotes
     s = str(val).split(' ')[0].replace(',', '').replace('%', '')
     try: return float(s)
     except: return 0.0
 
-# --- ENGINE: GREEDY PARSER ---
+def is_valid_county_row(name):
+    """
+    FILTERS OUT GARBAGE:
+    - Must be a string
+    - Must NOT be a Survey Question (Q1, Q4, etc.)
+    - Must NOT be a Summary Header (Member Group, Total)
+    - Must likely contain a State Abbr (KY, TN, FL, etc) or be a known county format
+    """
+    s = str(name).strip()
+    if len(s) < 3: return False
+    
+    # Blacklist keywords found in your screenshot
+    blacklist = ["member group", "total", "grand total", "all members", "question", "q1", "q2", "q3", "q4", "none"]
+    if any(x in s.lower() for x in blacklist): return False
+    
+    # Survey Question Pattern (e.g. "Q25 - In the last...")
+    if re.match(r'^Q\d+', s): return False
+    
+    return True
+
+# --- ENGINE: FENCED PARSER ---
 @st.cache_data
 def run_geo_parser(uploaded_file):
     extracted_data = []
     
     with pdfplumber.open(uploaded_file) as pdf:
         for page in pdf.pages:
-            tables = page.extract_tables()
+            text = page.extract_text() or ""
             
+            # --- FENCE 1: IGNORE SURVEY PAGES ---
+            # If the page talks about "Survey", "Questionnaire", or "CAHPS", SKIP IT.
+            if "survey" in text.lower() or "questionnaire" in text.lower() or "cahps" in text.lower():
+                continue
+
+            tables = page.extract_tables()
             for table in tables:
                 if not table or len(table) < 2: continue
                 
                 for row in table:
-                    # Filter out purely empty rows
                     if not row or len(row) < 3: continue
                     
-                    # 1. GRAB NUMBERS FIRST (The Source of Truth)
-                    # We look for ANY cell that looks like a number
+                    # 1. VALIDATE NAME
+                    county_cand = str(row[0]).strip()
+                    
+                    # Handle offset columns (sometimes Col 0 is blank/number, Col 1 is Name)
+                    data_start_idx = 1
+                    if not is_valid_county_row(county_cand):
+                        if len(row) > 1 and is_valid_county_row(row[1]):
+                            county_cand = str(row[1]).strip()
+                            data_start_idx = 2
+                        else:
+                            continue # Skip this row
+
+                    # 2. EXTRACT NUMBERS
                     numerics = []
-                    for cell in row:
+                    for cell in row[data_start_idx:]:
                         val = clean_numeric(cell)
                         if val > 0: numerics.append(val)
                     
-                    # We need at least 2 numbers (Lives + Distance) to consider this valid data
+                    # 3. LOGIC CHECK
                     if len(numerics) >= 2:
-                        
-                        # 2. IDENTIFY COUNTY NAME
-                        # If the row has valid numbers, we assume the first text cell is the name
-                        county_cand = str(row[0]).strip()
-                        
-                        # Fix: If Col 0 is "Large Metro" or empty, grab Col 1
-                        if not county_cand or "Metro" in county_cand or "Micro" in county_cand:
-                            if len(row) > 1: county_cand = str(row[1]).strip()
-                            
-                        # Final Garbage Check: If name is "Total", skip it (we sum it ourselves)
-                        if "Total" in county_cand or "Average" in county_cand: continue
-
-                        # 3. ASSIGN VALUES
-                        # Assumption: Largest Int = Lives. Smallest Float = Distance.
                         lives = max(numerics)
                         
-                        # Get distance (remove the lives count from the pool)
+                        # Sanity Check: Lives cannot match the Total Member Count (144,875)
+                        # This prevents capturing the Header Row as a Data Row
+                        if lives > 140000: continue 
+
                         remaining = [n for n in numerics if n != lives]
                         dist = min(remaining) if remaining else 0.0
                         
-                        # Sanity Check: If "Distance" is 100.0, it's likely the Access % column
+                        # Fix for 100.0 Access % masquerading as Distance
                         if dist == 100.0 and len(remaining) > 1:
                             dist = sorted(remaining)[0]
                             
+                        # Double check distance isn't insane (e.g. 2018 year parsed as distance)
+                        if dist > 200: continue
+
                         extracted_data.append({
-                            "County": county_cand,
+                            "County": county_cand.replace('\n', ' '),
                             "Lives": int(lives),
                             "Avg Dist": dist,
-                            "Raw Data": str(row) # For debugging if needed
+                            "Status": "Parsed"
                         })
 
     df = pd.DataFrame(extracted_data)
     
     if not df.empty:
-        # Deduplicate based on exact match of Name + Lives + Dist
+        # Deduplicate exact matches (Page 5 vs Page 8 repeats)
         df = df.drop_duplicates(subset=['County', 'Lives', 'Avg Dist'])
         
     return df
@@ -160,7 +165,7 @@ if uploaded_file:
                 "Risk Level": st.column_config.TextColumn("Status"),
             },
             use_container_width=True,
-            height=400,
+            height=600,
             hide_index=True
         )
 
