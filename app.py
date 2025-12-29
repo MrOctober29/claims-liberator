@@ -113,7 +113,7 @@ def generate_strategy(issue_county, dist, lives, specialty):
     <div class="strategy-card">
         <div class="strategy-title">1. Contract Protection: "Safe Harbor" Clause</div>
         <div class="strategy-body">
-            <b>The Play:</b> {lives} members in {issue_county} are legally exposed. 
+            <b>The Play:</b> {int(lives)} members in {issue_county} are legally exposed. 
             Negotiate a "Safe Harbor" clause ensuring In-Network benefit levels (deductibles/copays) 
             for any claim incurred within this zip cluster if a network provider is not available within 15 miles.
         </div>
@@ -186,14 +186,14 @@ if uploaded_file:
 
         st.markdown("---")
 
-        # 2. VISUALS (SIMPLIFIED)
+        # 2. VISUALS (RANKED BAR CHART)
         c_chart, c_list = st.columns([2, 1])
         
         with c_chart:
             st.subheader("📊 Top 10 Longest Drive Times")
             st.caption("Counties where members face the highest barriers to care.")
             
-            # Simple Bar Chart - Easy to read
+            # This replaces the Bubble Chart
             top_10 = gdf.sort_values("Avg Dist", ascending=False).head(10)
             fig = px.bar(top_10, x="Avg Dist", y="County", orientation='h', 
                          color="Risk", color_discrete_map={'Good': '#2e86de', 'Critical': '#ff4b4b'},
@@ -232,7 +232,7 @@ if uploaded_file:
             strategy_html = generate_strategy(
                 top_issue['County'], 
                 top_issue['Avg Dist'], 
-                int(top_issue['Lives']), 
+                top_issue['Lives'], 
                 top_issue['Specialty']
             )
             st.markdown(strategy_html, unsafe_allow_html=True)
