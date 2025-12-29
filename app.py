@@ -1,7 +1,7 @@
 import streamlit as st
 import pdfplumber
 import pandas as pd
-import plotly.express as px
+import re
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Network Intelligence Suite", layout="wide")
@@ -9,255 +9,194 @@ st.set_page_config(page_title="Network Intelligence Suite", layout="wide")
 # --- CUSTOM CSS ---
 st.markdown("""
     <style>
-    .stApp { background-color: #0e1117; }
-    
-    /* Metrics */
-    .metric-box {
-        background-color: rgba(255, 255, 255, 0.05);
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        border-radius: 8px;
-        padding: 20px;
-        text-align: center;
-        margin-bottom: 10px;
-    }
-    .big-stat { font-size: 28px; font-weight: 700; color: #ffffff; }
-    .stat-label { font-size: 12px; color: #a0a0a0; text-transform: uppercase; letter-spacing: 1px; }
-    
-    /* Strategy Cards */
-    .strategy-card {
-        background-color: rgba(30, 41, 59, 0.5);
-        border-left: 4px solid #00cc96;
-        padding: 20px;
-        border-radius: 4px;
-        margin-bottom: 15px;
-    }
-    .strategy-title { font-weight: bold; color: #00cc96; font-size: 16px; margin-bottom: 5px; }
-    .strategy-body { font-size: 14px; color: #e0e0e0; }
-    
-    /* Critical Alert */
-    .alert-card {
-        background-color: rgba(100, 20, 20, 0.3);
-        border-left: 4px solid #ff4b4b;
-        padding: 20px;
-        border-radius: 4px;
-        margin-bottom: 15px;
-    }
-    .alert-title { font-weight: bold; color: #ff4b4b; font-size: 16px; margin-bottom: 5px; }
-    
-    /* Disclaimer */
-    .disclaimer { font-size: 11px; color: #666; margin-top: 50px; text-align: center; }
+    .stApp { background-color: #0f1116; }
+    .big-stat { font-size: 32px; font-weight: 700; color: #ffffff; }
+    .stat-label { font-size: 14px; color: #a0a0a0; }
     </style>
     """, unsafe_allow_html=True)
 
-# --- HELPER FUNCTIONS ---
-def clean_numeric(val_str):
-    if not val_str: return 0.0
-    clean = str(val_str).split(' ')[0] 
-    clean = clean.replace('%', '').replace(',', '').strip()
-    try: return float(clean)
-    except ValueError: return 0.0
+# --- HELPER: CLEANING ---
+def clean_numeric(val):
+    if not val: return 0.0
+    s = str(val).split(' ')[0].replace(',', '').replace('%', '')
+    try: return float(s)
+    except: return 0.0
 
-# --- ENGINE: GEO PARSER ---
+def is_valid_county(val):
+    """
+    STRICT FILTER: Only accepts format 'Name, ST' (e.g., 'Adair, KY').
+    Reject 'Large Metro', 'Total', 'Micro', etc.
+    """
+    s = str(val).strip()
+    # Must have a comma and be longer than 3 chars (e.g. "X, Y" is min)
+    if "," not in s or len(s) < 4: return False
+    # Reject lines with numbers in the name (e.g. "Total 2024")
+    if any(char.isdigit() for char in s): return False
+    return True
+
+# --- ENGINE: ROBUST PARSER ---
 @st.cache_data
 def run_geo_parser(uploaded_file):
     extracted_data = []
-    current_specialty = "General Access"
-    known_specialties = ["Primary Care", "Pediatrics", "OB/GYN", "Behavioral", "Cardiology", "Orthopedics", "Pharmacy"]
-
+    
     with pdfplumber.open(uploaded_file) as pdf:
         for page in pdf.pages:
-            text = page.extract_text() or ""
             tables = page.extract_tables()
-            
-            # Detect Context
-            for spec in known_specialties:
-                if spec in text: 
-                    current_specialty = spec; break
             
             for table in tables:
                 if not table or len(table) < 2: continue
                 
-                # Analyze Header (First 4 rows)
-                header_text = " ".join([str(cell).lower() for row in table[:4] for cell in row if cell])
-                
-                if "county" in header_text and ("member" in header_text or "#" in header_text):
-                    for row in table:
-                        if not row or "county" in str(row[0]).lower(): continue
-                        try:
-                            county = str(row[0]).strip()
-                            if not county and row[1]: county = str(row[1]).strip()
-                            if not county or "Total" in county: continue
+                # We iterate through ROWS, not headers, to find the pattern
+                for row in table:
+                    # Filter out short rows or empty rows
+                    if not row or len(row) < 3: continue
+                    
+                    # 1. FIND THE COUNTY NAME
+                    # Usually in Col 0, but sometimes Col 1 if Col 0 is "Large Metro"
+                    county_cand = str(row[0]).strip()
+                    
+                    # If Col 0 isn't a county (e.g. "Large Metro"), check Col 1
+                    if not is_valid_county(county_cand):
+                        if len(row) > 1 and is_valid_county(row[1]):
+                            county_cand = str(row[1]).strip()
+                            # If we shifted to Col 1, the data usually shifts too
+                            data_start_idx = 2
+                        else:
+                            continue # Skip this row, it's garbage
+                    else:
+                        data_start_idx = 1
 
-                            nums = []
-                            for cell in row[1:]:
-                                val = clean_numeric(cell)
-                                if val > 0: nums.append(val)
+                    # 2. EXTRACT NUMBERS (The "Smart Scan")
+                    # We grab all numbers in the rest of the row
+                    numerics = []
+                    for cell in row[data_start_idx:]:
+                        val = clean_numeric(cell)
+                        if val > 0: numerics.append(val)
+                    
+                    # 3. ASSIGN DATA (Heuristic Logic)
+                    # We need at least 2 numbers: [Lives, Distance] or [Lives, Access, Distance]
+                    if len(numerics) >= 2:
+                        # Assumption for Quest/Optum Reports:
+                        # Largest Integer = Member Count
+                        # Float between 0-50 = Distance
+                        # Float > 80 (usually 100) = Access %
+                        
+                        lives = max(numerics) # Lives is usually the biggest number
+                        
+                        # Remove lives from list to find distance
+                        remaining = [n for n in numerics if n != lives]
+                        
+                        dist = 0.0
+                        access = 100.0
+                        
+                        if remaining:
+                            # Distance is usually the smallest non-zero number
+                            dist = min(remaining)
                             
-                            if len(nums) >= 2:
-                                extracted_data.append({
-                                    "County": county,
-                                    "Specialty": current_specialty,
-                                    "Lives": nums[0],
-                                    "Avg Dist": nums[1],
-                                    "Access %": 100.0 # Default
-                                })
-                        except: continue
-    return pd.DataFrame(extracted_data)
+                        # Edge Case: If Distance is somehow parsed as 100.0 (like in your screenshot), 
+                        # we correct it. Real average distances > 60 miles are rare.
+                        if dist == 100.0 and len(remaining) > 1:
+                            dist = sorted(remaining)[0] # Take the smaller one
+                            
+                        extracted_data.append({
+                            "County": county_cand,
+                            "Lives": int(lives),
+                            "Avg Dist": dist,
+                            "Access %": 100.0 # Defaulting to 100 unless we see a gap
+                        })
 
-# --- STRATEGY GENERATOR ---
-def generate_strategy(issue_county, dist, lives, specialty):
-    strategies = []
-    
-    # Strategy 1: The Contract Shield
-    strategies.append(f"""
-    <div class="strategy-card">
-        <div class="strategy-title">1. Contract Protection: "Safe Harbor" Clause</div>
-        <div class="strategy-body">
-            <b>The Play:</b> {int(lives)} members in {issue_county} are legally exposed. 
-            Negotiate a "Safe Harbor" clause ensuring In-Network benefit levels (deductibles/copays) 
-            for any claim incurred within this zip cluster if a network provider is not available within 15 miles.
-        </div>
-    </div>
-    """)
-    
-    # Strategy 2: The Tactical Fix
-    if dist > 20:
-        strategies.append(f"""
-        <div class="strategy-card">
-            <div class="strategy-title">2. Benefit Override: Travel & Lodging Rider</div>
-            <div class="strategy-body">
-                <b>The Play:</b> Driving {dist} miles is a barrier to care. 
-                Propose a specialized travel rider allowing up to $100/visit reimbursement for 
-                {specialty} services in this specific county. This is cheaper than one ER visit due to delayed care.
-            </div>
-        </div>
-        """)
-    else:
-        strategies.append(f"""
-        <div class="strategy-card">
-            <div class="strategy-title">2. Recruitment: Geo-Nomination Campaign</div>
-            <div class="strategy-body">
-                <b>The Play:</b> Submit a formal "Network Deficiency Notice" to the carrier. 
-                Require them to attempt recruitment of 3 specific providers in {issue_county} 
-                within 60 days or offer a Single Case Agreement (SCA).
-            </div>
-        </div>
-        """)
-        
-    # Strategy 3: The Financial Defense
-    strategies.append(f"""
-    <div class="strategy-card">
-        <div class="strategy-title">3. Financial Defense: RBP Overlay</div>
-        <div class="strategy-body">
-            <b>The Play:</b> If the carrier cannot solve {issue_county}, carve out this specific region 
-            and apply a Reference Based Pricing (RBP) vendor for {specialty} claims only.
-        </div>
-    </div>
-    """)
-    
-    return "".join(strategies)
+    return pd.DataFrame(extracted_data)
 
 # --- MAIN UI ---
 st.title("🛡️ Network Intelligence Suite")
-st.markdown("##### Empowering Benefit Advisors with Actionable Insights")
+st.markdown("##### Strategic Network Analysis")
 
-uploaded_file = st.file_uploader("Upload GeoAccess Report (PDF)", type=["pdf"])
+uploaded_file = st.file_uploader("Upload GeoAccess PDF", type=["pdf"])
 
 if uploaded_file:
-    with st.spinner("Extracting insights..."):
-        gdf = run_geo_parser(uploaded_file)
-    
-    if not gdf.empty:
-        # Aggregation
-        gdf = gdf.groupby(['County', 'Specialty']).agg({'Lives': 'sum', 'Avg Dist': 'mean'}).reset_index()
-        
-        # Risk Logic (Threshold: 15 miles)
-        gdf['Risk'] = gdf['Avg Dist'].apply(lambda x: 'Critical' if x > 15 else 'Good')
-        critical = gdf[gdf['Risk'] == 'Critical'].sort_values('Avg Dist', ascending=False)
-        
-        # 1. KPI ROW
-        total_lives = gdf['Lives'].sum()
-        w_avg_dist = (gdf['Lives'] * gdf['Avg Dist']).sum() / total_lives if total_lives else 0
-        
-        m1, m2, m3 = st.columns(3)
-        m1.markdown(f"""<div class="metric-box"><div class="big-stat">{int(total_lives):,}</div><div class="stat-label">Lives Analyzed</div></div>""", unsafe_allow_html=True)
-        m2.markdown(f"""<div class="metric-box"><div class="big-stat">{w_avg_dist:.1f} mi</div><div class="stat-label">Avg Drive Time</div></div>""", unsafe_allow_html=True)
-        m3.markdown(f"""<div class="metric-box"><div class="big-stat" style="color:#ff4b4b">{len(critical)}</div><div class="stat-label">Critical Zones</div></div>""", unsafe_allow_html=True)
+    with st.spinner("Extracting & Cleaning Data..."):
+        df = run_geo_parser(uploaded_file)
 
+    if not df.empty:
+        # Aggregation (Handle dupes)
+        df = df.groupby('County').agg({'Lives': 'sum', 'Avg Dist': 'mean'}).reset_index()
+        
+        # Risk Analysis
+        df['Risk Level'] = df['Avg Dist'].apply(lambda x: 'Critical' if x > 15 else ('Warning' if x > 10 else 'Stable'))
+        critical = df[df['Risk Level'] == 'Critical'].sort_values('Avg Dist', ascending=False)
+        
+        # --- METRICS ---
+        total_lives = df['Lives'].sum()
+        w_avg_dist = (df['Lives'] * df['Avg Dist']).sum() / total_lives if total_lives else 0
+        
+        c1, c2, c3 = st.columns(3)
+        c1.markdown(f"""<div class="metric-box"><div class="big-stat">{total_lives:,.0f}</div><div class="stat-label">Lives Analyzed</div></div>""", unsafe_allow_html=True)
+        c2.markdown(f"""<div class="metric-box"><div class="big-stat">{w_avg_dist:.1f} mi</div><div class="stat-label">Avg Drive Distance</div></div>""", unsafe_allow_html=True)
+        c3.markdown(f"""<div class="metric-box"><div class="big-stat" style="color:#ff4b4b">{len(critical)}</div><div class="stat-label">Critical Counties (>15mi)</div></div>""", unsafe_allow_html=True)
+        
         st.markdown("---")
-
-        # 2. VISUALS (RANKED BAR CHART)
-        c_chart, c_list = st.columns([2, 1])
         
-        with c_chart:
-            st.subheader("📊 Top 10 Longest Drive Times")
-            st.caption("Counties where members face the highest barriers to care.")
-            
-            # This replaces the Bubble Chart
-            top_10 = gdf.sort_values("Avg Dist", ascending=False).head(10)
-            fig = px.bar(top_10, x="Avg Dist", y="County", orientation='h', 
-                         color="Risk", color_discrete_map={'Good': '#2e86de', 'Critical': '#ff4b4b'},
-                         text_auto='.1f', title="")
-            fig.update_layout(yaxis={'categoryorder':'total ascending'}, xaxis_title="Average Miles to Provider", yaxis_title="")
-            st.plotly_chart(fig, use_container_width=True)
-            
-        with c_list:
-            st.subheader("🚨 Risk Ledger")
-            if not critical.empty:
-                st.dataframe(
-                    critical[['County', 'Lives', 'Avg Dist']]
-                    .style.format({"Avg Dist": "{:.1f} mi", "Lives": "{:,.0f}"}), 
-                    use_container_width=True, height=400
-                )
-            else:
-                st.success("No counties exceed the 15-mile risk threshold.")
+        # --- THE CLEAN DATA GRID (Replacing the confusing charts) ---
+        st.subheader("📍 County Access Ledger")
+        st.caption("Sorted by longest drive time. Critical areas highlighted in red.")
+        
+        # We use Streamlit's Native Column Config for a beautiful table
+        st.dataframe(
+            df.sort_values("Avg Dist", ascending=False),
+            column_order=("County", "Lives", "Avg Dist", "Risk Level"),
+            column_config={
+                "County": "County Name",
+                "Lives": st.column_config.NumberColumn("Member Count", format="%d"),
+                "Avg Dist": st.column_config.ProgressColumn(
+                    "Avg Drive (Miles)",
+                    help="Average miles to nearest provider",
+                    format="%.1f mi",
+                    min_value=0,
+                    max_value=max(df['Avg Dist'].max(), 20), # Cap visual at 20+
+                ),
+                "Risk Level": st.column_config.TextColumn("Status"),
+            },
+            use_container_width=True,
+            height=400,
+            hide_index=True
+        )
 
-        # 3. ADVISOR STRATEGY
+        # --- ACTION PLAN (Native UI Components - No more HTML glitches) ---
         st.markdown("---")
-        st.subheader("🧠 Strategic Action Plan")
-        
+        st.subheader("🧠 Strategic Advisor Plan")
+
         if not critical.empty:
-            top_issue = critical.iloc[0]
+            top_county = critical.iloc[0]
             
+            # 1. The Alert Box
+            st.error(f"🔥 **Primary Risk Target: {top_county['County']}**")
             st.markdown(f"""
-            <div class="alert-card">
-                <div class="alert-title">🔥 Primary Target: {top_issue['County']}</div>
-                Analysis shows <b>{int(top_issue['Lives'])} members</b> are currently forced to drive 
-                <b>{top_issue['Avg Dist']:.1f} miles</b> for {top_issue['Specialty']} services. 
-                This exceeds the standard of care.
-            </div>
-            """, unsafe_allow_html=True)
+            **The Issue:** {top_county['Lives']} members are driving an average of **{top_county['Avg Dist']:.1f} miles** to find care.
+            This exceeds the standard benchmark (15 miles) and exposes the plan to leakage.
+            """)
             
-            # Generate the detailed strategy text
-            strategy_html = generate_strategy(
-                top_issue['County'], 
-                top_issue['Avg Dist'], 
-                top_issue['Lives'], 
-                top_issue['Specialty']
-            )
-            st.markdown(strategy_html, unsafe_allow_html=True)
+            c_strat1, c_strat2 = st.columns(2)
             
+            with c_strat1:
+                with st.container(border=True):
+                    st.markdown("#### 1. Contract Strategy")
+                    st.markdown("**Safe Harbor Clause**")
+                    st.caption("Negotiate In-Network deductibles for any claim in this county if a provider isn't available within 15 miles.")
+            
+            with c_strat2:
+                with st.container(border=True):
+                    st.markdown("#### 2. Tactical Fix")
+                    st.markdown("**Travel Rider**")
+                    st.caption(f"Implement a travel reimbursement ($50/visit) specifically for members in {top_county['County']} to avoid ER usage.")
+        
         else:
-            st.markdown("""
-            <div class="strategy-card">
-                <div class="strategy-title">✅ Market Check Complete</div>
-                <div class="strategy-body">
-                    The network meets all standard access requirements. 
-                    <b>Action:</b> Leverage this strong access report to defend against competitor 
-                    proposals that may offer lower premiums but narrower networks.
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
+            st.success("✅ **Network is Stable.** No critical access gaps detected.")
+            st.info("Leverage this report to defend the current carrier against narrow-network competitors.")
 
-        # 4. DISCLAIMER
-        st.markdown("""
-        <div class="disclaimer">
-        <b>DISCLAIMER:</b> This analysis is generated based on data parsed from third-party PDF reports uploaded by the user. 
-        Formatting inconsistencies in original carrier reports may affect extraction accuracy. 
-        Advisors should verify all critical figures with the carrier before executing contracts.
-        </div>
-        """, unsafe_allow_html=True)
+        # --- DISCLAIMER ---
+        st.markdown("---")
+        st.caption("⚠️ **Disclaimer:** Data is extracted programmatically from uploaded carrier reports. Formatting inconsistencies in PDF source files may affect accuracy. Please verify critical figures with the carrier.")
 
     else:
-        st.error("⚠️ Unable to Extract Data")
-        st.markdown("The uploaded PDF structure does not match standard GeoAccess formats. Please verify the file contains County Detail tables.")
+        st.warning("⚠️ No valid county data found.")
+        st.markdown("The parser couldn't find rows formatted like **'County, State'** (e.g., 'Adair, KY'). Please ensure your PDF contains the County Detail pages.")
