@@ -26,32 +26,33 @@ st.markdown("""
 # --- HELPER: CLEANING ---
 def clean_numeric(val):
     if not val: return 0.0
-    # Clean string: remove % , and footnotes
     s = str(val).split(' ')[0].replace(',', '').replace('%', '')
     try: return float(s)
     except: return 0.0
 
 def is_valid_county_row(name):
     """
-    FILTERS OUT GARBAGE:
-    - Must be a string
-    - Must NOT be a Survey Question (Q1, Q4, etc.)
-    - Must NOT be a Summary Header (Member Group, Total)
-    - Must likely contain a State Abbr (KY, TN, FL, etc) or be a known county format
+    STRICT VALIDATION:
+    1. Must be a string > 3 chars.
+    2. Must NOT be 'Total', 'Group', 'Question', 'Metro', 'Micro'.
+    3. MUST contain a comma (e.g. "Adair, KY") OR end in a state code (e.g. "Adair KY").
     """
     s = str(name).strip()
-    if len(s) < 3: return False
+    if len(s) < 4: return False
     
-    # Blacklist keywords found in your screenshot
-    blacklist = ["member group", "total", "grand total", "all members", "question", "q1", "q2", "q3", "q4", "none"]
-    if any(x in s.lower() for x in blacklist): return False
+    s_lower = s.lower()
+    blacklist = ["total", "member", "group", "question", "metro", "micro", "rural", "urban", "all members", "grand"]
+    if any(x in s_lower for x in blacklist): return False
     
-    # Survey Question Pattern (e.g. "Q25 - In the last...")
-    if re.match(r'^Q\d+', s): return False
+    # Check for Comma (Standard Format)
+    if "," in s: return True
     
-    return True
+    # Fallback: Check for State Code at end (e.g. "Adair KY")
+    if re.search(r'\s[A-Z]{2}$', s): return True
+    
+    return False
 
-# --- ENGINE: FENCED PARSER ---
+# --- ENGINE: STATE VALIDATOR PARSER ---
 @st.cache_data
 def run_geo_parser(uploaded_file):
     extracted_data = []
@@ -60,8 +61,7 @@ def run_geo_parser(uploaded_file):
         for page in pdf.pages:
             text = page.extract_text() or ""
             
-            # --- FENCE 1: IGNORE SURVEY PAGES ---
-            # If the page talks about "Survey", "Questionnaire", or "CAHPS", SKIP IT.
+            # Skip Survey Pages
             if "survey" in text.lower() or "questionnaire" in text.lower() or "cahps" in text.lower():
                 continue
 
@@ -72,17 +72,18 @@ def run_geo_parser(uploaded_file):
                 for row in table:
                     if not row or len(row) < 3: continue
                     
-                    # 1. VALIDATE NAME
+                    # 1. FIND COUNTY NAME
+                    # Check Col 0
                     county_cand = str(row[0]).strip()
-                    
-                    # Handle offset columns (sometimes Col 0 is blank/number, Col 1 is Name)
                     data_start_idx = 1
+                    
+                    # If Col 0 is invalid (e.g. "Large Metro"), check Col 1
                     if not is_valid_county_row(county_cand):
                         if len(row) > 1 and is_valid_county_row(row[1]):
                             county_cand = str(row[1]).strip()
                             data_start_idx = 2
                         else:
-                            continue # Skip this row
+                            continue # Skip row, it's not a county
 
                     # 2. EXTRACT NUMBERS
                     numerics = []
@@ -90,36 +91,33 @@ def run_geo_parser(uploaded_file):
                         val = clean_numeric(cell)
                         if val > 0: numerics.append(val)
                     
-                    # 3. LOGIC CHECK
                     if len(numerics) >= 2:
+                        # Logic: Largest Int = Lives. Smallest Float = Distance.
                         lives = max(numerics)
                         
-                        # Sanity Check: Lives cannot match the Total Member Count (144,875)
-                        # This prevents capturing the Header Row as a Data Row
-                        if lives > 140000: continue 
+                        # Sanity Check for Lives (Avoid parsing "Total" rows that slipped through)
+                        if lives > 100000: continue 
 
                         remaining = [n for n in numerics if n != lives]
                         dist = min(remaining) if remaining else 0.0
                         
-                        # Fix for 100.0 Access % masquerading as Distance
+                        # Fix "100.0" Access % being picked as distance
                         if dist == 100.0 and len(remaining) > 1:
                             dist = sorted(remaining)[0]
                             
-                        # Double check distance isn't insane (e.g. 2018 year parsed as distance)
-                        if dist > 200: continue
-
                         extracted_data.append({
                             "County": county_cand.replace('\n', ' '),
                             "Lives": int(lives),
-                            "Avg Dist": dist,
-                            "Status": "Parsed"
+                            "Avg Dist": dist
                         })
 
     df = pd.DataFrame(extracted_data)
     
     if not df.empty:
-        # Deduplicate exact matches (Page 5 vs Page 8 repeats)
-        df = df.drop_duplicates(subset=['County', 'Lives', 'Avg Dist'])
+        # INTELLIGENT DEDUPLICATION
+        # Group by County Name and take the MAX lives and MAX distance found.
+        # This handles the case where Page 5 and Page 8 have the same county.
+        df = df.groupby('County').agg({'Lives': 'max', 'Avg Dist': 'max'}).reset_index()
         
     return df
 
@@ -130,22 +128,19 @@ st.markdown("##### Strategic Network Analysis")
 uploaded_file = st.file_uploader("Upload GeoAccess PDF", type=["pdf"])
 
 if uploaded_file:
-    with st.spinner("Extracting Data..."):
+    with st.spinner("Analyzing PDF..."):
         df = run_geo_parser(uploaded_file)
 
     if not df.empty:
-        # Aggregation
-        final_df = df.groupby('County').agg({'Lives': 'max', 'Avg Dist': 'mean'}).reset_index()
-        
         # Risk Analysis
-        final_df['Risk Level'] = final_df['Avg Dist'].apply(lambda x: 'Critical' if x > 15 else ('Warning' if x > 10 else 'Stable'))
-        critical = final_df[final_df['Risk Level'] == 'Critical'].sort_values('Avg Dist', ascending=False)
+        df['Risk Level'] = df['Avg Dist'].apply(lambda x: 'Critical' if x > 15 else ('Warning' if x > 10 else 'Stable'))
+        critical = df[df['Risk Level'] == 'Critical'].sort_values('Avg Dist', ascending=False)
         
         # Metrics
-        total_lives = final_df['Lives'].sum()
-        w_avg_dist = (final_df['Lives'] * final_df['Avg Dist']).sum() / total_lives if total_lives else 0
+        total_lives = df['Lives'].sum()
+        w_avg_dist = (df['Lives'] * df['Avg Dist']).sum() / total_lives if total_lives else 0
         
-        # --- TOP LEVEL METRICS ---
+        # --- METRICS ---
         c1, c2, c3 = st.columns(3)
         c1.markdown(f"""<div class="metric-box"><div class="big-stat">{total_lives:,.0f}</div><div class="stat-label">Lives Analyzed</div></div>""", unsafe_allow_html=True)
         c2.markdown(f"""<div class="metric-box"><div class="big-stat">{w_avg_dist:.1f} mi</div><div class="stat-label">Avg Drive Distance</div></div>""", unsafe_allow_html=True)
@@ -156,12 +151,12 @@ if uploaded_file:
         # --- DATA GRID ---
         st.subheader("📍 County Access Ledger")
         st.dataframe(
-            final_df.sort_values("Avg Dist", ascending=False),
+            df.sort_values("Avg Dist", ascending=False),
             column_order=("County", "Lives", "Avg Dist", "Risk Level"),
             column_config={
                 "County": "County Name",
                 "Lives": st.column_config.NumberColumn("Member Count", format="%d"),
-                "Avg Dist": st.column_config.ProgressColumn("Avg Drive (Miles)", format="%.1f mi", min_value=0, max_value=max(final_df['Avg Dist'].max(), 20)),
+                "Avg Dist": st.column_config.ProgressColumn("Avg Drive (Miles)", format="%.1f mi", min_value=0, max_value=max(df['Avg Dist'].max(), 20)),
                 "Risk Level": st.column_config.TextColumn("Status"),
             },
             use_container_width=True,
@@ -198,4 +193,4 @@ if uploaded_file:
 
     else:
         st.error("⚠️ No Data Found")
-        st.markdown("We couldn't extract any valid data rows. Please check if the PDF is a scanned image.")
+        st.markdown("We couldn't extract any valid data rows. Please ensure the PDF is text-readable and follows standard Quest/Optum formatting.")
