@@ -4,230 +4,157 @@ import pandas as pd
 import plotly.express as px
 import re
 
-# --- CONFIGURATION ---
-st.set_page_config(page_title="Network Disruption & ROI", layout="wide")
+st.set_page_config(page_title="Strategic Network Analyzer", layout="wide")
 
-# --- CUSTOM CSS ---
+# --- CSS FOR "STRATEGY CARDS" ---
 st.markdown("""
     <style>
     .stApp { background-color: #0e1117; }
-    .metric-box {
-        background-color: rgba(255, 255, 255, 0.05);
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        border-radius: 8px;
-        padding: 20px;
-        text-align: center;
+    .strategy-card {
+        background-color: rgba(0, 200, 150, 0.1);
+        border-left: 5px solid #00cc96;
+        padding: 15px;
+        border-radius: 5px;
         margin-bottom: 10px;
     }
-    .big-stat { font-size: 28px; font-weight: 700; color: #ffffff; }
-    .stat-label { font-size: 12px; color: #a0a0a0; text-transform: uppercase; letter-spacing: 1px; }
-    .highlight-red { color: #ff4b4b; font-weight: bold; }
+    .alert-card {
+        background-color: rgba(255, 75, 75, 0.1);
+        border-left: 5px solid #ff4b4b;
+        padding: 15px;
+        border-radius: 5px;
+        margin-bottom: 10px;
+    }
     </style>
     """, unsafe_allow_html=True)
 
-# --- HELPER FUNCTIONS ---
+# --- PARSERS ---
 def clean_numeric(val_str):
-    """Aggressively cleans strings to floats (e.g. '1,234.5%' -> 1234.5)"""
     if not val_str: return 0.0
-    clean = str(val_str).replace('%', '').replace(',', '').replace(' ', '').strip()
+    clean = str(val_str).replace('%', '').replace(',', '').strip()
     try: return float(clean)
-    except ValueError: return 0.0
+    except: return 0.0
 
-# --- ENGINE: CENSUS PARSER ---
-@st.cache_data
-def run_census_parser(uploaded_file):
-    try:
-        if uploaded_file.name.endswith('.csv'): df = pd.read_csv(uploaded_file)
-        else: df = pd.read_excel(uploaded_file)
-    except Exception as e: return pd.DataFrame(), str(e)
-    
-    df.columns = [c.strip().lower() for c in df.columns]
-    zip_col = next((c for c in df.columns if 'zip' in c), None)
-    
-    if not zip_col: return pd.DataFrame(), "Missing Zip Column"
-    
-    processed = pd.DataFrame()
-    processed['Zip'] = df[zip_col].astype(str).str[:5]
-    processed['Count'] = 1
-    return processed, None
-
-# --- ENGINE: ADVANCED GEOACCESS PARSER ---
 @st.cache_data
 def run_geo_parser(uploaded_file):
-    extracted_data = []
-    report_type = "Unknown"
+    extracted = []
+    network_name = "Unknown Network"
     
     with pdfplumber.open(uploaded_file) as pdf:
+        # 1. Detect Network Name from Header
+        first_page = pdf.pages[0].extract_text()
+        if "Network Analyzed:" in first_page:
+            try:
+                network_name = first_page.split("Network Analyzed:")[1].split('\n')[0].strip()
+            except: pass
+            
+        # 2. Extract County Tables
         for page in pdf.pages:
             tables = page.extract_tables()
-            text = page.extract_text() or ""
-            
-            # Identify Specialty context from page header (e.g. "Primary Care")
-            specialty_context = "Unknown Specialty"
-            if "Primary Care" in text: specialty_context = "Primary Care"
-            elif "Pediatrics" in text: specialty_context = "Pediatrics"
-            elif "Behavioral" in text: specialty_context = "Behavioral Health"
-            
             for table in tables:
                 if not table: continue
-                
-                # --- STRATEGY 1: COUNTY DETAIL TABLE (Complex) ---
-                # Looks for: County | Member # | Avg Dist OR With Access %
-                # Found in the Kentucky Sample
-                headers = [str(c).lower().replace('\n',' ') for c in table[0] if c]
-                header_str = " ".join(headers)
-                
-                if "county" in header_str and ("member" in header_str or "#" in header_str):
-                    report_type = "County Detail"
+                # Flatten header to find "County" and "Access"
+                header = [str(x).lower() for x in table[0]]
+                if "county" in str(header) and ("%" in str(header) or "access" in str(header)):
+                    # Map Columns
+                    col_map = {'name': -1, 'lives': -1, 'access': -1, 'dist': -1}
+                    for i, col in enumerate(header):
+                        if "county" in col: col_map['name'] = i
+                        if "member" in col or "#" in col: col_map['lives'] = i
+                        if "access" in col and "without" not in col: col_map['access'] = i
+                        if "dist" in col: col_map['dist'] = i
                     
-                    # map columns dynamically
-                    col_map = {'county': -1, 'lives': -1, 'dist': -1, 'access': -1}
-                    
-                    for idx, col_name in enumerate(headers):
-                        if "county" in col_name: col_map['county'] = idx
-                        elif "member" in col_name or "#" in col_name: col_map['lives'] = idx
-                        elif "dist" in col_name: col_map['dist'] = idx
-                        elif "access" in col_name and "without" not in col_name: col_map['access'] = idx
-                    
-                    # Parse rows
-                    if col_map['county'] != -1:
-                        for row in table[1:]:
-                            try:
-                                # Clean row data
-                                county = row[col_map['county']].replace('\n',' ')
-                                lives = clean_numeric(row[col_map['lives']]) if col_map['lives'] != -1 else 0
-                                dist = clean_numeric(row[col_map['dist']]) if col_map['dist'] != -1 else 0
-                                access = clean_numeric(row[col_map['access']]) if col_map['access'] != -1 else 100.0 # Default to 100 if not found
-                                
-                                if lives > 0: # Filter out empty rows
-                                    extracted_data.append({
-                                        "Type": "County",
-                                        "Name": county,
-                                        "Specialty": specialty_context,
-                                        "Lives": lives,
-                                        "Avg Dist": dist,
-                                        "Access %": access
-                                    })
-                            except: continue
+                    # Parse Rows
+                    for row in table[1:]:
+                        try:
+                            extracted.append({
+                                "County": row[col_map['name']],
+                                "Lives": clean_numeric(row[col_map['lives']]),
+                                "Access %": clean_numeric(row[col_map['access']]),
+                                "Avg Dist": clean_numeric(row[col_map['dist']])
+                            })
+                        except: continue
 
-                # --- STRATEGY 2: SUMMARY TABLE (Simple) ---
-                # Looks for: Specialty | Access %
-                elif "specialty" in header_str and "access" in header_str:
-                    report_type = "Summary"
-                    # (Logic from v3.0 - kept for backwards compatibility)
-                    spec_idx = next((i for i, h in enumerate(headers) if "specialty" in h), -1)
-                    acc_idx = next((i for i, h in enumerate(headers) if "access" in h or "%" in h), -1)
-                    
-                    if spec_idx != -1 and acc_idx != -1:
-                        for row in table[1:]:
-                            try:
-                                extracted_data.append({
-                                    "Type": "Summary",
-                                    "Name": "All Counties",
-                                    "Specialty": row[spec_idx].replace('\n',' '),
-                                    "Lives": 0,
-                                    "Avg Dist": 0,
-                                    "Access %": clean_numeric(row[acc_idx])
-                                })
-                            except: continue
-
-    return pd.DataFrame(extracted_data), report_type
+    return pd.DataFrame(extracted), network_name
 
 # --- MAIN UI ---
-st.title("🛡️ Network Disruption & ROI")
-st.markdown("##### Enterprise-Grade Analysis for GeoAccess & Census Data")
+st.title("🛡️ Strategic Network Analyzer")
+st.markdown("##### Detect gaps. Prescribe solutions. Close the deal.")
 
-col1, col2 = st.columns(2)
-census_file = col1.file_uploader("1. Upload Census (CSV/Excel)", type=["csv", "xlsx"])
-geo_file = col2.file_uploader("2. Upload GeoAccess Report (PDF)", type=["pdf"])
+geo_file = st.file_uploader("Upload GeoAccess Report (PDF)", type=["pdf"])
 
-# Run Parsers
-if census_file: st.session_state['cdf'], _ = run_census_parser(census_file)
-if geo_file: st.session_state['gdf'], st.session_state['rtype'] = run_geo_parser(geo_file)
-
-if 'cdf' in st.session_state and 'gdf' in st.session_state:
-    cdf = st.session_state['cdf']
-    gdf = st.session_state['gdf']
-    report_type = st.session_state.get('rtype', 'Unknown')
+if geo_file:
+    df, net_name = run_geo_parser(geo_file)
     
-    if not gdf.empty:
-        st.markdown("---")
-        st.success(f"✅ Data Extracted Successfully (Mode: {report_type})")
+    if not df.empty:
+        st.success(f"📂 Analyzed Network: **{net_name}**")
         
-        # --- VIEW 1: IF COUNTY DETAIL (The Sophisticated View) ---
-        if report_type == "County Detail":
-            # This handles the Kentucky-style report
-            st.subheader("📍 Geographic Weakness Detector")
-            st.caption("Analyzing member distance and access at the COUNTY level.")
-            
-            # 1. METRICS
-            total_lives = gdf['Lives'].sum()
-            avg_dist = (gdf['Lives'] * gdf['Avg Dist']).sum() / total_lives if total_lives else 0
-            # Weighted Access Calculation
-            w_access = (gdf['Lives'] * gdf['Access %']).sum() / total_lives if total_lives else 0
-            
-            m1, m2, m3 = st.columns(3)
-            m1.markdown(f"""<div class="metric-box"><div class="big-stat">{int(total_lives):,}</div><div class="stat-label">Lives Mapped</div></div>""", unsafe_allow_html=True)
-            m2.markdown(f"""<div class="metric-box"><div class="big-stat">{avg_dist:.1f} mi</div><div class="stat-label">Avg Drive Distance</div></div>""", unsafe_allow_html=True)
-            m3.markdown(f"""<div class="metric-box"><div class="big-stat">{w_access:.1f}%</div><div class="stat-label">Weighted Access</div></div>""", unsafe_allow_html=True)
-            
-            # 2. THE PROBLEM ZONES (Scatter Plot)
-            # Y-Axis = Distance (Bad), X-Axis = # of Lives (Impact), Color = Access %
-            st.markdown("### 🚦 The Disruption Matrix")
-            st.info("Top Right Quadrant = **High Risk** (Many people driving long distances).")
-            
-            fig = px.scatter(gdf, x="Lives", y="Avg Dist", size="Lives", color="Access %",
-                             hover_name="Name", text="Name",
-                             color_continuous_scale="RdYlGn", # Red = Low Access
-                             title="County Analysis: Distance vs. Density",
-                             height=500)
-            fig.update_traces(textposition='top center')
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # 3. WORST OFFENDERS LIST
-            st.subheader("🚨 Top 5 'Problem Counties'")
-            # Rank by (Distance * Lives) to find largest aggregate burden
-            gdf['Burden Score'] = gdf['Avg Dist'] * gdf['Lives']
-            bad_counties = gdf.sort_values("Burden Score", ascending=False).head(5)
-            
-            st.dataframe(
-                bad_counties[['Name', 'Specialty', 'Lives', 'Avg Dist', 'Access %']]
-                .style.format({"Avg Dist": "{:.1f} mi", "Access %": "{:.1f}%"}), 
-                use_container_width=True
-            )
-
-        # --- VIEW 2: IF SUMMARY ONLY (The Standard View) ---
-        else:
-            st.subheader("📉 Network Gaps Summary")
-            avg_access = gdf['Access %'].mean()
-            st.metric("Overall Network Score", f"{avg_access:.1f}%")
-            
-            fig = px.bar(gdf, x="Specialty", y="Access %", color="Access %", 
-                         range_y=[50, 105], color_continuous_scale="RdYlGn")
-            fig.add_hline(y=90, line_dash="dot", annotation_text="Standard (90%)")
-            st.plotly_chart(fig, use_container_width=True)
-
-        # --- ROI CALCULATOR (Universal) ---
-        st.markdown("---")
-        st.subheader("💰 Disruption ROI Calculator")
+        # 1. THE "PROBLEM FINDER"
+        df['Risk'] = df['Access %'].apply(lambda x: 'Critical' if x < 85 else ('Warning' if x < 95 else 'Good'))
+        critical = df[df['Risk'] == 'Critical']
         
-        # Calculate disrupted lives based on the loaded data
-        if report_type == "County Detail":
-            disrupted_lives = gdf[gdf['Access %'] < 95]['Lives'].sum()
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total Counties", len(df))
+        c2.metric("Avg Access", f"{df['Access %'].mean():.1f}%")
+        c3.metric("Critical Gaps", len(critical), delta_color="inverse")
+        
+        # 2. VISUALIZE THE PAIN
+        st.subheader("📍 Gap Identification Matrix")
+        fig = px.scatter(df, x="Lives", y="Avg Dist", size="Lives", color="Risk",
+                         hover_name="County", text="County",
+                         color_discrete_map={'Good': '#00cc96', 'Warning': '#ffa500', 'Critical': '#ff4b4b'},
+                         title="Distance vs. Member Density (Top Right = High Impact Gaps)")
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # 3. THE BROKER GUIDE (Prescriptive Logic)
+        st.markdown("---")
+        st.subheader("🧠 Broker Strategy Guide")
+        
+        if not critical.empty:
+            st.markdown(f"""
+            <div class="alert-card">
+            <b>🚨 Critical Network Failures Detected</b><br>
+            The following counties have access below 85%. This is your leverage point.
+            </div>
+            """, unsafe_allow_html=True)
+            
+            st.dataframe(critical)
+            
+            # DYNAMIC RECOMMENDATIONS
+            st.markdown("### 🛠️ Recommended Fixes")
+            
+            # Fix 1: Disruption Report
+            st.markdown(f"""
+            <div class="strategy-card">
+            <b>1. Request a Provider Disruption Report</b><br>
+            Since <b>{critical.iloc[0]['County']}</b> has {critical.iloc[0]['Access %']}% access, ask {net_name} to run a disruption report specifically for the {int(critical['Lives'].sum())} lives in these counties.
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # Fix 2: Travel Benefit
+            if critical['Avg Dist'].max() > 20:
+                st.markdown(f"""
+                <div class="strategy-card">
+                <b>2. Propose a "Travel & Lodging" Benefit</b><br>
+                Members in <b>{critical.iloc[0]['County']}</b> are driving over {critical['Avg Dist'].max()} miles. 
+                Suggest adding a travel reimbursement rider ($50/visit) for specialists > 50 miles away.
+                </div>
+                """, unsafe_allow_html=True)
+                
+            # Fix 3: Direct Contracting
+            st.markdown(f"""
+            <div class="strategy-card">
+            <b>3. Explore Direct Contracting</b><br>
+            If {net_name} cannot solve the gap in {critical.iloc[0]['County']}, consider a direct contract with the local hospital system or a "Wrap Network" like MultiPlan for this specific zip cluster.
+            </div>
+            """, unsafe_allow_html=True)
+            
         else:
-            # Estimate based on census total if we only have percentages
-            total_census = len(cdf) if not cdf.empty else 1000
-            disrupted_lives = int(total_census * (1 - (gdf['Access %'].mean()/100)))
-
-        c1, c2 = st.columns([1,2])
-        with c1:
-            st.markdown("**Assumptions**")
-            cost_oon = st.number_input("Avg OON Claim ($)", 300)
-            freq = st.slider("Visits per Disrupted Member/Yr", 1, 10, 3)
-        with c2:
-            waste = disrupted_lives * cost_oon * freq
-            st.markdown(f"#### Estimated Leakage: <span class='highlight-red'>${waste:,.0f}</span>", unsafe_allow_html=True)
-            st.write(f"Based on **{int(disrupted_lives)}** members in low-access areas/specialties.")
-
+            st.markdown("""
+            <div class="strategy-card">
+            <b>✅ Network is Stable</b><br>
+            No critical gaps found. Use this data to validate the renewal increase or defend against competitor poaching.
+            </div>
+            """, unsafe_allow_html=True)
+            
     else:
-        st.info("Upload files to see the analysis.")
+        st.error("Could not parse county data. Ensure PDF matches the standard format.")
