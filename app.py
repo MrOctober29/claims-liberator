@@ -116,7 +116,10 @@ def run_geo_parser(uploaded_file):
                         if val > 0: numerics.append(val)
                     
                     if len(numerics) >= 2:
-                        lives = max(numerics)
+                        # --- THE FIX ---
+                        # OLD LOGIC: lives = max(numerics)  <- Caused the 557 error (82% > 50 lives)
+                        # NEW LOGIC: lives = numerics[0]    <- GeoAccess standard: Lives is ALWAYS the first number
+                        lives = numerics[0]
                         
                         # Sanity Cap (prevents reading "Total Members 144,000" as a county)
                         if lives > 200000: continue 
