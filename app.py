@@ -22,27 +22,24 @@ st.markdown("""
 
 # --- HELPER FUNCTIONS ---
 def clean_numeric(val):
-    """Converts string to float, handling commas and %."""
     if not val: return 0.0
     s = str(val).split(' ')[0].replace(',', '').replace('%', '')
     try: return float(s)
     except: return 0.0
 
 def is_valid_county_name(s):
-    """Checks if a string looks like a county (e.g., 'Adair, KY')."""
     s = str(s).strip()
     if len(s) < 4: return False
     if "," not in s: return False
-    blacklist = ["total", "member", "group", "metro", "micro", "rural", "urban", "grand", "access", "analysis"]
+    blacklist = ["total", "member", "group", "metro", "micro", "rural", "urban", "grand", "access", "analysis", "without"]
     if any(x in s.lower() for x in blacklist): return False
     return True
 
 def split_cell_values(cell_text):
-    """Splits a multiline cell into a clean list of values, removing empty lines."""
     if not cell_text: return []
     return [x.strip() for x in str(cell_text).split('\n') if x.strip()]
 
-# --- ENGINE: ADAPTIVE PARSER ---
+# --- ENGINE: HYBRID PARSER ---
 @st.cache_data
 def run_geo_parser(uploaded_file):
     extracted_data = []
@@ -59,67 +56,56 @@ def run_geo_parser(uploaded_file):
                 for row in table:
                     clean_row = [str(x).strip() if x else "" for x in row]
                     
-                    # 1. FIND THE COUNTY COLUMN
+                    # 1. FIND COUNTY COLUMN
                     county_idx = -1
                     county_values = []
-                    
                     for i, cell in enumerate(clean_row):
                         values = split_cell_values(cell)
                         if values and is_valid_county_name(values[0]):
                             county_idx = i
                             county_values = values
                             break
-                    
                     if county_idx == -1: continue
 
-                    # 2. FIND NUMERIC COLUMNS (Lives & Dist)
+                    # 2. FIND DATA COLUMNS
                     num_rows = len(county_values)
                     lives_values = []
                     dist_values = []
                     
-                    # Gather all columns that match the structure (same # of lines)
                     candidate_cols = []
                     for i, cell in enumerate(clean_row):
                         if i == county_idx: continue
                         values = split_cell_values(cell)
-                        if len(values) == num_rows and all(clean_numeric(v) >= 0 for v in values):
-                            candidate_cols.append(values)
-                    
-                    # Decision Logic: Which column is Lives?
+                        # Relaxed matching: Allow columns with MORE values (sometimes headers sneak in)
+                        if len(values) >= num_rows:
+                            # Verify numeric content
+                            if any(clean_numeric(v) >= 0 for v in values[:num_rows]):
+                                candidate_cols.append(values[:num_rows])
+
+                    # 3. DECISION LOGIC (Lives vs Distance)
                     if candidate_cols:
-                        # Heuristic A: Look for Large Numbers (Humana)
-                        large_num_col = next((col for col in candidate_cols if any(clean_numeric(x) > 100 for x in col)), None)
+                        # Lives is typically the column with the Largest Integer Max
+                        # Distance typically has the Smallest Float Max (and usually contains decimals)
                         
-                        if large_num_col:
-                            lives_values = large_num_col
-                            # Distance is likely the one with small decimals
-                            dist_values = next((col for col in candidate_cols if col != lives_values and any("." in x for x in col)), None)
-                        else:
-                            # Heuristic B: Small Numbers (Precision Demo) -> Assume 1st Numeric Col is Lives
-                            lives_values = candidate_cols[0]
-                            if len(candidate_cols) > 1:
-                                dist_values = candidate_cols[-1] # Usually last column is distance
+                        # Sort cols by their Max Value
+                        candidate_cols.sort(key=lambda col: max([clean_numeric(x) for x in col]), reverse=True)
+                        
+                        if len(candidate_cols) >= 1:
+                            lives_values = candidate_cols[0] # Largest numbers = Lives
+                        
+                        if len(candidate_cols) >= 2:
+                            # Look for the smallest max value that isn't lives
+                            dist_values = candidate_cols[-1] # Smallest numbers = Distance
 
-                    # Fallback for single-line rows that weren't caught
-                    if not lives_values and num_lines == 1:
-                        numerics = [clean_numeric(x) for x in clean_row if clean_numeric(x) > 0]
-                        if len(numerics) >= 2:
-                            # If numbers are small (<100), assume index 0 is Lives
-                            if max(numerics) < 100:
-                                lives_values = [str(numerics[0])]
-                                dist_values = [str(numerics[-1])]
-                            else:
-                                lives_values = [str(max(numerics))]
-                                dist_values = [str(min(numerics))]
-
-                    # 3. EXTRACT
+                    # 4. DATA EXTRACTION
                     if lives_values:
                         for j in range(num_rows):
                             c_name = county_values[j]
                             l_val = clean_numeric(lives_values[j])
                             d_val = clean_numeric(dist_values[j]) if dist_values else 0.0
                             
-                            if l_val > 200000: continue # Sanity Cap
+                            # Filter "Grand Total" lines that might look like counties
+                            if l_val > 200000: continue
                             
                             extracted_data.append({
                                 "County": c_name,
@@ -130,22 +116,36 @@ def run_geo_parser(uploaded_file):
     df = pd.DataFrame(extracted_data)
     
     if not df.empty:
-        # 4. SMART AGGREGATION
-        # Step A: Drop Exact Duplicates (Fixes Humana Page 5 vs Page 8 repetition)
+        # --- THE FIX ---
+        
+        # STEP 1: Strict Row Deduplication
+        # This removes the exact duplicate pages in the Humana Report (Page 5 vs Page 8)
         df = df.drop_duplicates(subset=['County', 'Lives', 'Avg Dist'])
         
-        # Step B: Sum remaining (Fixes Demo File split zip codes)
-        df = df.groupby('County').agg({'Lives': 'sum', 'Avg Dist': 'mean'}).reset_index()
+        # STEP 2: Aggregation by Sum
+        # This correctly adds up the split zip codes in the Complex Report (Adair 122 + Adair 51)
+        # Note: We take Weighted Average for distance
         
-        # Step C: Grand Total Killer
+        # Helper for weighted average
+        df['Weighted_Dist'] = df['Lives'] * df['Avg Dist']
+        
+        df = df.groupby('County').agg({
+            'Lives': 'sum',
+            'Weighted_Dist': 'sum'
+        }).reset_index()
+        
+        df['Avg Dist'] = df['Weighted_Dist'] / df['Lives']
+        
+        # STEP 3: Grand Total Safety Net
+        # If a single row contains > 90% of the total lives, it's a Summary Row. Kill it.
         total_sum = df['Lives'].sum()
-        df = df[df['Lives'] < (total_sum * 0.9)] 
+        df = df[df['Lives'] < (total_sum * 0.9)]
         
     return df
 
 # --- UI LOGIC ---
 st.sidebar.markdown("## **Apex** Intelligence")
-st.sidebar.caption("Benefit Advisory Cloud • v3.2")
+st.sidebar.caption("Benefit Advisory Cloud • v3.3")
 st.sidebar.markdown("---")
 menu = st.sidebar.radio("Platform Modules", ["Network Disruption", "Claims Intelligence", "Census Mapper", "SBC Decoder"], format_func=lambda x: f"🔒 {x}" if x != "Network Disruption" else f"🚀 {x}")
 st.sidebar.markdown("---")
