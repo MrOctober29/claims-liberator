@@ -15,7 +15,7 @@ st.set_page_config(
 )
 
 # --- DATABASE MANAGEMENT ---
-DB_NAME = "rx_claims_v2.db"
+DB_NAME = "rx_claims_v3.db"
 
 def init_db():
     conn = sqlite3.connect(DB_NAME)
@@ -47,7 +47,6 @@ def save_to_db(df):
 
 def load_clients():
     conn = sqlite3.connect(DB_NAME)
-    # Check if table exists first
     try:
         query = """
             SELECT 
@@ -95,25 +94,28 @@ def clean_int(val):
     try: return int(s)
     except: return 0
 
-# --- ROBUST PARSER ---
+# --- ROBUST "SIGNATURE" PARSER ---
 def parse_rx_report(uploaded_file):
     records = []
     client_name = "Unknown Client"
     current_month_str = None
     
+    # We will accumulate logs to help debug if needed
+    logs = []
+
     with pdfplumber.open(uploaded_file) as pdf:
-        for page in pdf.pages:
+        for page_num, page in enumerate(pdf.pages):
             text = page.extract_text() or ""
             tables = page.extract_tables()
 
-            # 1. Metadata Extraction 
+            # 1. Metadata Extraction
             if "Client Name:" in text:
                 try:
                     match = re.search(r"Client Name:\s*(.*)", text)
                     if match: client_name = match.group(1).strip()
                 except: pass
 
-            # 2. Month Detection 
+            # 2. Month Detection
             month_match = re.search(r'(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})', text)
             if month_match:
                 try:
@@ -123,118 +125,129 @@ def parse_rx_report(uploaded_file):
                     current_month_str = month_match.group(0)
 
             # 3. Table Parsing
-            for table in tables:
+            for table_idx, table in enumerate(tables):
                 if not table: continue
                 
-                # Context Detection within Table Header 
-                # We assume the table has a structure like:
-                # Row 0: ... MAIL ... (Header)
-                # Row 1: ... Brand ... Generic ... (Subheader)
-                # Row 2: Scripts | Ing Cost | ... (Columns)
-                
-                # Flatten first 3 rows to find keywords
-                header_dump = " ".join([str(x).upper() for row in table[:4] for x in row if x])
-                
+                # A. Detect Context (Mail vs Retail)
+                # We scan the first few rows for keywords
+                header_dump = " ".join([str(x).upper() for row in table[:5] for x in row if x])
                 current_channel = "Unknown"
                 if "MAIL" in header_dump: current_channel = "Mail Order"
                 elif "RETAIL" in header_dump: current_channel = "Retail"
-                else: continue # Skip tables that aren't Rx data (e.g. disclaimer tables)
+                else: 
+                    # Fallback: check page text just before table? 
+                    # For now, if Unknown, we skip or label Unknown.
+                    pass
 
-                # Locate Column Indexes Dynamically
-                # We search for the row containing "Scripts" to anchor our indexes
-                brand_idx = -1
-                generic_idx = -1
+                # B. Find Data Blocks using "Signature Matching"
+                # We look for the "Scripts" column headers
+                block_indices = [] # Stores (start_index, type) tuples
                 
-                # Iterate rows to find the "Data Start" row
+                header_row_idx = -1
+                
                 for r_idx, row in enumerate(table):
-                    row_str = " ".join([str(x) for x in row if x])
+                    # Clean row for matching
+                    row_clean = [str(x).strip().lower() if x else "" for x in row]
                     
-                    # If we find the column headers row
-                    if "Scripts" in row_str and "Ingredient" in row_str:
-                        # Find where "Scripts" appears. 
-                        # Usually appearing twice: once for Brand, once for Generic.
-                        script_indices = [i for i, x in enumerate(row) if x and "Scripts" in str(x)]
+                    # Find indices where "script" appears
+                    script_locs = [i for i, x in enumerate(row_clean) if "script" in x]
+                    
+                    if script_locs:
+                        # Validate if this is a header row by checking neighbors
+                        # Expecting: Scripts | Ingredient | Dispensing | Gross | Member | Plan
+                        valid_blocks = []
+                        for loc in script_locs:
+                            # Look ahead 1-2 columns for "Ingredient" or "Cost"
+                            # We check a window of next 3 columns to handle empty cols
+                            window = " ".join(row_clean[loc+1:loc+4])
+                            if "ingredient" in window or "dispensing" in window or "cost" in window or "fee" in window:
+                                valid_blocks.append(loc)
                         
-                        if len(script_indices) >= 2:
-                            brand_idx = script_indices[0]
-                            generic_idx = script_indices[1]
-                        elif len(script_indices) == 1:
-                            # Maybe only one block? Assume Brand if ambiguous
-                            brand_idx = script_indices[0]
+                        if valid_blocks:
+                            header_row_idx = r_idx
+                            
+                            # Assign Types (Brand vs Generic)
+                            # Logic: First block is Brand, Second is Generic
+                            if len(valid_blocks) >= 2:
+                                block_indices.append({'idx': valid_blocks[0], 'type': 'Brand'})
+                                block_indices.append({'idx': valid_blocks[1], 'type': 'Generic'})
+                            elif len(valid_blocks) == 1:
+                                # If only one block found, check context or default to Brand
+                                block_indices.append({'idx': valid_blocks[0], 'type': 'Brand'})
+                            
+                            # Found the header, stop scanning for headers in this table
+                            break
+                
+                # C. Extract Data
+                if header_row_idx != -1 and block_indices:
+                    # Iterate rows below header
+                    for r_idx in range(header_row_idx + 1, len(table)):
+                        row = table[r_idx]
+                        clean_row = [str(x).strip() if x else "" for x in row]
                         
-                        # Now iterate the DATA rows following this header
-                        for data_row in table[r_idx+1:]:
-                            clean_row = [str(x).strip() if x else "" for x in data_row]
-                            
-                            # Valid Row Check
-                            if not clean_row or len(clean_row) < 5: continue
-                            row_label = clean_row[0]
-                            
-                            # Skip Garbage Rows
-                            if not row_label or any(x in row_label for x in ["Scripts", "Ingredient", "Total", "Cost", "Client"]):
-                                continue
+                        # Row Validation
+                        if not clean_row or len(clean_row) < 5: continue
+                        row_label = clean_row[0]
+                        
+                        # Stop keywords
+                        if not row_label or any(x in row_label.lower() for x in ["script", "ingredient", "total", "client", "page"]):
+                            continue
 
-                            # EXTRACT BRAND
-                            if brand_idx != -1 and len(clean_row) > brand_idx + 5:
+                        # Extract for each block
+                        for block in block_indices:
+                            start_i = block['idx']
+                            drug_type = block['type']
+                            
+                            # Ensure row has enough columns
+                            if len(clean_row) > start_i + 5:
                                 try:
-                                    b_scripts = clean_int(clean_row[brand_idx])
-                                    b_gross = clean_money(clean_row[brand_idx+3]) # Gross is usually +3 from Scripts
-                                    b_plan = clean_money(clean_row[brand_idx+5])  # Plan is usually +5
+                                    # MAPPING (Standard Aon/Optum Offset):
+                                    # 0: Scripts
+                                    # 1: Ing Cost
+                                    # 2: Disp Fee
+                                    # 3: Gross Cost (sometimes +3, sometimes +4 depending on spacer)
+                                    # ...
+                                    # Let's dynamically find Gross/Plan based on money format if strict indexing fails
                                     
-                                    if b_scripts > 0 or b_gross > 0:
+                                    # Strict Indexing (usually works if we found the anchor)
+                                    # [Script, Ing, Disp, Gross, Mem, Plan]
+                                    
+                                    val_scripts = clean_int(clean_row[start_i])
+                                    val_gross = clean_money(clean_row[start_i+3]) # Gross is usually +3
+                                    val_plan = clean_money(clean_row[start_i+5])  # Plan is usually +5
+                                    
+                                    # Data Check: Must have Scripts or Cost
+                                    if val_scripts > 0 or val_gross > 0:
                                         records.append({
                                             "client_name": client_name,
                                             "report_month": current_month_str,
                                             "cohort_group": row_label,
                                             "delivery_channel": current_channel,
-                                            "drug_type": "Brand",
-                                            "scripts": b_scripts,
-                                            "ingredient_cost": clean_money(clean_row[brand_idx+1]),
-                                            "dispensing_fee": clean_money(clean_row[brand_idx+2]),
-                                            "gross_cost": b_gross,
-                                            "member_pay": clean_money(clean_row[brand_idx+4]),
-                                            "plan_pay": b_plan
+                                            "drug_type": drug_type,
+                                            "scripts": val_scripts,
+                                            "ingredient_cost": clean_money(clean_row[start_i+1]),
+                                            "dispensing_fee": clean_money(clean_row[start_i+2]),
+                                            "gross_cost": val_gross,
+                                            "member_pay": clean_money(clean_row[start_i+4]),
+                                            "plan_pay": val_plan
                                         })
-                                except: pass
+                                except Exception as e:
+                                    logs.append(f"Row Parse Error: {e}")
 
-                            # EXTRACT GENERIC
-                            if generic_idx != -1 and len(clean_row) > generic_idx + 5:
-                                try:
-                                    g_scripts = clean_int(clean_row[generic_idx])
-                                    g_gross = clean_money(clean_row[generic_idx+3])
-                                    g_plan = clean_money(clean_row[generic_idx+5])
-                                    
-                                    if g_scripts > 0 or g_gross > 0:
-                                        records.append({
-                                            "client_name": client_name,
-                                            "report_month": current_month_str,
-                                            "cohort_group": row_label,
-                                            "delivery_channel": current_channel,
-                                            "drug_type": "Generic",
-                                            "scripts": g_scripts,
-                                            "ingredient_cost": clean_money(clean_row[generic_idx+1]),
-                                            "dispensing_fee": clean_money(clean_row[generic_idx+2]),
-                                            "gross_cost": g_gross,
-                                            "member_pay": clean_money(clean_row[generic_idx+4]),
-                                            "plan_pay": b_plan
-                                        })
-                                except: pass
-                        break # Stop looking for headers in this table once found
-
-    return pd.DataFrame(records)
+    return pd.DataFrame(records), logs
 
 # --- APP UI ---
 init_db()
 
 st.sidebar.title("💊 Apex Rx Advisor")
-st.sidebar.caption("Book of Business v3.0")
+st.sidebar.caption("Book of Business v3.1")
 
-menu = st.sidebar.radio("Navigation", ["📂 Book of Business", "📤 Upload New Files", "⚙️ Admin"])
+menu = st.sidebar.radio("Navigation", ["📂 Book of Business", "📤 Upload New Files", "⚙️ Admin", "🔧 Debugger"])
 
 # --- UPLOAD ---
 if menu == "📤 Upload New Files":
     st.title("📤 Ingest New Client Data")
-    st.markdown("Upload **Monthly Rx PDF Reports**. The system will scan headers dynamically to find data.")
+    st.markdown("Upload **Monthly Rx PDF Reports**. The system uses signature matching to find data blocks.")
     
     uploaded_files = st.file_uploader("Drop Aon/Optum PDFs here", type=["pdf"], accept_multiple_files=True)
     
@@ -245,21 +258,22 @@ if menu == "📤 Upload New Files":
             
             for i, file in enumerate(uploaded_files):
                 try:
-                    df_part = parse_rx_report(file)
+                    df_part, logs = parse_rx_report(file)
                     if not df_part.empty:
                         save_to_db(df_part)
                         total_records += len(df_part)
                     else:
-                        st.warning(f"File {file.name} yielded no data. Check format.")
+                        st.warning(f"File {file.name}: No data found.")
+                        if logs: st.expander("Logs").write(logs)
                 except Exception as e:
-                    st.error(f"Error processing {file.name}: {e}")
+                    st.error(f"Critical Error {file.name}: {e}")
                 
                 progress_bar.progress((i + 1) / len(uploaded_files))
             
             if total_records > 0:
                 st.success(f"✅ Successfully saved {total_records} records to the Vault.")
             else:
-                st.error("❌ No valid records found. The parser could not find the 'Scripts' columns.")
+                st.error("❌ No valid records found.")
 
 # --- BOOK OF BUSINESS ---
 elif menu == "📂 Book of Business":
@@ -273,7 +287,6 @@ elif menu == "📂 Book of Business":
         st.markdown("### Active Clients")
         for index, row in clients_df.iterrows():
             with st.container():
-                # Client Card
                 st.markdown(f"""
                 <div style="background-color: #1e2129; padding: 20px; border-radius: 10px; border: 1px solid #30363d; margin-bottom: 15px;">
                     <h3>🏢 {row['client_name']}</h3>
@@ -306,21 +319,19 @@ elif menu == "📂 Book of Business":
         if sel_months:
             dff = df[df['report_month'].isin(sel_months)]
             
-            # Metrics
+            # KPI Calculations
             tot_spend = dff['plan_pay'].sum()
             tot_scripts = dff['scripts'].sum()
             
-            # GUR
             gen_scripts = dff[dff['drug_type']=='Generic']['scripts'].sum()
             gur = (gen_scripts / tot_scripts * 100) if tot_scripts else 0
             
-            # Mail Order
             mail_scripts = dff[dff['delivery_channel']=='Mail Order']['scripts'].sum()
             mail_pen = (mail_scripts / tot_scripts * 100) if tot_scripts else 0
             
-            # Plan Efficiency (Member Share)
             mem_share_pct = (dff['member_pay'].sum() / dff['gross_cost'].sum() * 100) if dff['gross_cost'].sum() else 0
             
+            # Metrics Row
             k1, k2, k3, k4 = st.columns(4)
             k1.metric("Total Plan Spend", f"${tot_spend:,.0f}")
             k2.metric("Generic Use (GUR)", f"{gur:.1f}%", delta="Target: >85%", delta_color="off")
@@ -333,12 +344,10 @@ elif menu == "📂 Book of Business":
             with tab1:
                 c1, c2 = st.columns(2)
                 with c1:
-                    # Cohort Spend
                     fig_coh = px.bar(dff.groupby('cohort_group')['plan_pay'].sum().reset_index(), 
                                      x='plan_pay', y='cohort_group', orientation='h', title="Spend by Cohort")
                     st.plotly_chart(fig_coh, use_container_width=True)
                 with c2:
-                    # Brand vs Generic
                     fig_pie = px.pie(dff.groupby('drug_type')['plan_pay'].sum().reset_index(), 
                                      values='plan_pay', names='drug_type', title="Spend by Drug Type",
                                      color_discrete_sequence=['#ef553b', '#00cc96'])
@@ -351,6 +360,18 @@ elif menu == "📂 Book of Business":
 
             with tab3:
                 st.dataframe(dff, use_container_width=True)
+
+# --- DEBUGGER ---
+elif menu == "🔧 Debugger":
+    st.title("🔧 Raw PDF Inspector")
+    st.markdown("Use this to check what the parser sees.")
+    debug_file = st.file_uploader("Upload 1 PDF for Inspection", type="pdf")
+    if debug_file:
+        with pdfplumber.open(debug_file) as pdf:
+            pages = st.slider("Select Page", 1, len(pdf.pages), 1)
+            page = pdf.pages[pages-1]
+            st.text(page.extract_text())
+            st.write("Tables Found:", page.extract_tables())
 
 # --- ADMIN ---
 elif menu == "⚙️ Admin":
