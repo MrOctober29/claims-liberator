@@ -106,14 +106,14 @@ def parse_rx_report(uploaded_file):
             text = page.extract_text() or ""
             tables = page.extract_tables()
 
-            # 1. Metadata Extraction
+            # 1. Metadata Extraction 
             if "Client Name:" in text:
                 try:
                     match = re.search(r"Client Name:\s*(.*)", text)
                     if match: client_name = match.group(1).strip()
                 except: pass
 
-            # 2. Month Detection
+            # 2. Month Detection 
             month_match = re.search(r'(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})', text)
             if month_match:
                 try:
@@ -126,7 +126,7 @@ def parse_rx_report(uploaded_file):
             for table in tables:
                 if not table: continue
                 
-                # Context Detection within Table Header
+                # Context Detection within Table Header 
                 # We assume the table has a structure like:
                 # Row 0: ... MAIL ... (Header)
                 # Row 1: ... Brand ... Generic ... (Subheader)
@@ -216,7 +216,7 @@ def parse_rx_report(uploaded_file):
                                             "dispensing_fee": clean_money(clean_row[generic_idx+2]),
                                             "gross_cost": g_gross,
                                             "member_pay": clean_money(clean_row[generic_idx+4]),
-                                            "plan_pay": g_plan
+                                            "plan_pay": b_plan
                                         })
                                 except: pass
                         break # Stop looking for headers in this table once found
